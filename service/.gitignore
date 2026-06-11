@@ -1,5 +1,9 @@
 # Build output + large/generated artifacts — keep source + scripts only.
 /target
 /models/*.onnx
-/testdata
+# testdata media stays out via the root ignores (*.jpg/png/mp4/jsonl);
+# the parity fixture + helpers MUST ship — behavior.rs's featurization
+# test fails by design when the fixture is missing.
+/testdata/*.mp4
+/testdata/*.log
 /tuning
