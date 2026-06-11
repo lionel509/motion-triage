@@ -1,0 +1,47 @@
+# ── Model weights ─ pulled at setup, never committed ─────────────────────────
+# (YOLO weights are AGPL; keeping them out also keeps the repo light.)
+models/
+*.onnx
+*.pt
+*.engine
+*.mlmodel
+*.mlpackage
+
+# ── Data ─ NEVER commit footage or logged training data into the open repo ───
+# This is the privacy boundary: pixels in, verdicts out. No customer footage,
+# no identifiable people, no logged keypoint sets from real deployments.
+data/
+datasets/
+gifs/
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.jsonl
+!service/testdata/*.json
+labels*.csv
+manifest*.csv
+!docs/**/*.png        # except diagrams checked into docs/
+
+# ── Rust ─────────────────────────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ── Env / editor / OS ────────────────────────────────────────────────────────
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/

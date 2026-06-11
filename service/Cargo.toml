@@ -1,0 +1,39 @@
+# Standalone spike workspace — deliberately NOT part of the agent-rs or server-rs
+# workspaces so the hardware-timed agent crates are never recompiled/perturbed
+# (per CLAUDE.md). Proves YOLO person detection on the Apple GPU via ONNX
+# Runtime + CoreML, in Rust. Step B of the YOLO-triage plan.
+[package]
+name = "yolo-triage"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+# ort downloads a prebuilt ONNX Runtime per-platform (no cmake/system libs
+# needed). The CoreML feature is macOS-only — the Apple EP symbol doesn't
+# exist in Windows/Linux onnxruntime binaries and fails at LINK time — so it
+# lives in the target-scoped section below; elsewhere ort runs the CPU EP.
+ort = { version = "=2.0.0-rc.9", features = ["ndarray"] }
+# Pin ort-sys to match ort rc.9 — rc.12's download build-script is broken
+# against current ureq (TLS feature mismatch). rc.9's predates that.
+ort-sys = "=2.0.0-rc.9"
+ndarray = "0.16"
+image = "0.25"
+anyhow = "1"
+# HTTP service: Python extracts clip frames (it has ffmpeg) and POSTs them here;
+# this service runs YOLO+track+classify on the Apple GPU and returns the verdict.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = { version = "0.7", features = ["multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `coreml` enables the Apple-GPU/ANE provider. Cargo unions features
+# per-platform, so on macOS ort gains coreml; elsewhere this section is inert.
+ort = { version = "=2.0.0-rc.9", features = ["coreml", "ndarray"] }
+
+# Keep this its own workspace root.
+[workspace]

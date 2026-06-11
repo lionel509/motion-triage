@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+// gRPC mirror of `POST /analyze` (see docs/API.md). Same verdict, typed and
+// streamable — for callers that prefer a generated client stub over multipart.
+// The HTTP and gRPC surfaces MUST stay in lockstep; docs/API.md is canonical.
+package motiontriage.v1;
+
+service MotionTriage {
+  // Unary: send a whole frame sequence, get one verdict back.
+  rpc Analyze(AnalyzeRequest) returns (Verdict);
+}
+
+message AnalyzeRequest {
+  // jpeg-encoded frames, time-ordered. 1 frame = fast gate; ~16 = full triage.
+  repeated bytes frame = 1;
+  Zones zones = 2;            // optional operator-drawn analytics
+}
+
+// ---- Operator-drawn zones / lines (coords are frame fractions, [0,1]) -------
+message Zones {
+  repeated Zone zones = 1;
+  repeated Line lines = 2;
+}
+message Zone {
+  string name = 1;
+  repeated Point polygon = 2;
+}
+message Line {
+  string name = 1;
+  Point a = 2;
+  Point b = 3;
+  string in_direction = 4;   // "a_to_b" | "b_to_a"
+}
+message Point {
+  float x = 1;               // frame fraction [0,1]
+  float y = 2;
+}
+
+// ---- Verdict ----------------------------------------------------------------
+message Verdict {
+  string decision = 1;       // "alert" | "dismiss"
+  string reason = 2;         // highest-severity track reason
+  uint32 detect_ms = 3;
+  uint32 frames = 4;
+  repeated Track tracks = 5;
+}
+
+message Track {
+  uint32 id = 1;
+  string cls = 2;            // "person" | "vehicle"
+  string decision = 3;
+  string reason = 4;
+  uint32 n = 5;              // points in the track
+  float straightness = 6;    // net / path length
+  float span = 7;            // net / frame diagonal
+  float dwell_frac = 8;      // frames seen / total frames
+  repeated Skeleton keypoints = 9;  // one per frame the track was seen
+}
+
+// 17 COCO joints, source-frame pixels. Empty until the pose layer ships.
+message Skeleton { repeated Keypoint joints = 1; }
+message Keypoint {
+  float x = 1;
+  float y = 2;
+  float conf = 3;
+}

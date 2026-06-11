@@ -1,0 +1,5 @@
+# Build output + large/generated artifacts — keep source + scripts only.
+/target
+/models/*.onnx
+/testdata
+/tuning
