@@ -25,6 +25,7 @@ use serde::Serialize;
 mod behavior;
 mod draw;
 mod pose;
+mod sus;
 
 const IMGSZ: u32 = 640;
 const CONF: f32 = 0.30;
@@ -266,7 +267,13 @@ struct TrackVerdict { id: usize, n: usize, straightness: f32, span: f32, dwell_f
     #[serde(skip_serializing_if = "Option::is_none")]
     behavior: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    behavior_conf: Option<f32> }
+    behavior_conf: Option<f32>,
+    // Suspicion score (sus.rs): flag/reason weight × night × zone, [0,1].
+    // Present only when SUS_POLICY is set. sus_alert = score >= threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sus_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sus_alert: Option<bool> }
 
 /// Is this person box at/adjacent to any vehicle box? True on real overlap, or
 /// when the person's center sits within a vehicle box expanded by ~8% of the
@@ -562,7 +569,8 @@ fn classify(t: &Track, total_frames: usize, w: f32, h: f32, vehicles: &[Det]) ->
     };
     (decision, TrackVerdict { id: t.id, n, straightness, span, dwell_frac,
         decision: decision.as_str().into(), reason: reason.into(),
-        keypoints: Vec::new(), behavior: None, behavior_conf: None })
+        keypoints: Vec::new(), behavior: None, behavior_conf: None,
+        sus_score: None, sus_alert: None })
 }
 
 #[derive(Serialize)]
@@ -704,8 +712,19 @@ fn behavior_escalates(class: &str, conf: f32, alert_classes: &[String], min_conf
 /// sequence is mostly padding and the logits are prior, not signal.
 const BEHAVIOR_MIN_POSE_FRAMES: usize = 4;
 
+/// Is the track's footpoint (bottom-centre of its last box) inside any
+/// operator zone? Used as the `in_zone` context multiplier for sus scoring.
+fn foot_in_zone(foot: (f32, f32), w: f32, h: f32, meta: &ZonesMeta) -> bool {
+    meta.zones.iter().any(|z| {
+        let poly: Vec<(f32, f32)> =
+            z.polygon.iter().map(|p| (p[0] * w, p[1] * h)).collect();
+        point_in_poly(foot, &poly)
+    })
+}
+
 fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
-              pose_session: Option<&Session>, beh: Option<&BehaviorCtx>) -> Result<TriageResult> {
+              pose_session: Option<&Session>, beh: Option<&BehaviorCtx>,
+              night: bool, sus_policy: Option<&sus::SusPolicy>) -> Result<TriageResult> {
     if frames.is_empty() {
         return Ok(TriageResult { decision: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, tracks: vec![] });
     }
@@ -804,6 +823,16 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
                 }
             }
         }
+        // Suspicion score: the flag/reason weight, multiplied by context
+        // (night + whether the footpoint sits in an operator zone). Additive —
+        // only populated when a SUS_POLICY is loaded.
+        if let Some(pol) = sus_policy {
+            let foot = (t.last.cx(), t.last.y2);
+            let (s, a) = pol.score(v.behavior.as_deref(), &v.reason, night,
+                                   foot_in_zone(foot, w, h, meta));
+            v.sus_score = Some((s * 1000.0).round() / 1000.0);
+            v.sus_alert = Some(a);
+        }
         decisions.push(d); verdicts.push(v);
     }
     // Event-level signals (multiple people / converging) over the full track set.
@@ -811,14 +840,16 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
             dwell_frac: 0.0, decision: "alert".into(), reason: reason.into(),
-            keypoints: Vec::new(), behavior: None, behavior_conf: None });
+            keypoints: Vec::new(), behavior: None, behavior_conf: None,
+            sus_score: None, sus_alert: None });
     }
     // Zone / door analytics (operator-drawn zones + lines, if any were POSTed).
     if let Some(reason) = zone_line_reason(&tracks, w, h, meta) {
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
             dwell_frac: 0.0, decision: "alert".into(), reason: reason.into(),
-            keypoints: Vec::new(), behavior: None, behavior_conf: None });
+            keypoints: Vec::new(), behavior: None, behavior_conf: None,
+            sus_score: None, sus_alert: None });
     }
     let event = if decisions.iter().any(|d| *d == Decision::Alert) { Decision::Alert } else { Decision::Dismiss };
     let reason = verdicts.iter()
@@ -860,6 +891,8 @@ struct AppState {
     // Optional behavior NN (BEHAVIOR_MODEL env). Requires pose to be on —
     // it classifies the skeleton trajectories pose produces.
     behavior: Option<Arc<BehaviorCtx>>,
+    // Optional suspicion policy (SUS_POLICY env). None = no sus fields emitted.
+    sus: Option<Arc<sus::SusPolicy>>,
 }
 
 async fn health() -> &'static str { "ok" }
@@ -867,14 +900,23 @@ async fn health() -> &'static str { "ok" }
 async fn triage_endpoint(State(st): State<AppState>, mut mp: Multipart) -> Json<serde_json::Value> {
     let mut frame_bytes: Vec<Vec<u8>> = Vec::new();
     let mut meta = ZonesMeta::default();
+    let mut night = false;
     while let Ok(Some(field)) = mp.next_field().await {
         let name = field.name().map(|s| s.to_string());
         let Ok(b) = field.bytes().await else { continue };
-        if name.as_deref() == Some("zones") {
-            // Optional JSON sidecar: operator-drawn zones/lines (frame fractions).
-            if let Ok(m) = serde_json::from_slice::<ZonesMeta>(&b) { meta = m; }
-        } else {
-            frame_bytes.push(b.to_vec());
+        match name.as_deref() {
+            Some("zones") => {
+                // Optional JSON sidecar: operator-drawn zones/lines (frame fractions).
+                if let Ok(m) = serde_json::from_slice::<ZonesMeta>(&b) { meta = m; }
+            }
+            Some("context") => {
+                // Optional {"night": bool} — the caller knows its site's local
+                // time; we don't guess timezone from UTC frames.
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
+                    night = v.get("night").and_then(|x| x.as_bool()).unwrap_or(false);
+                }
+            }
+            _ => frame_bytes.push(b.to_vec()),
         }
     }
     let res = tokio::task::spawn_blocking(move || -> Result<TriageResult> {
@@ -884,7 +926,8 @@ async fn triage_endpoint(State(st): State<AppState>, mut mp: Multipart) -> Json<
         }
         let s = st.session.lock().unwrap();
         let pose_guard = st.pose.as_ref().map(|p| p.lock().unwrap());
-        run_triage(&s, &frames, &meta, pose_guard.as_deref(), st.behavior.as_deref())
+        run_triage(&s, &frames, &meta, pose_guard.as_deref(), st.behavior.as_deref(),
+                   night, st.sus.as_deref())
     }).await;
     // On ANY failure, fail safe → escalate (let the VLM decide rather than drop).
     match res {
@@ -922,16 +965,28 @@ async fn main() -> Result<()> {
                 else { format!(", alerts on {:?}", b.alert_classes) }),
             None => "behavior off".to_string(),
         };
+        // Optional suspicion policy: SUS_POLICY=<path>.json adds a per-track
+        // sus_score + sus_alert (flag/reason weight × night × zone).
+        let sus = match std::env::var("SUS_POLICY") {
+            Ok(p) if !p.trim().is_empty() => Some(Arc::new(
+                sus::SusPolicy::load(&p).ok_or_else(
+                    || anyhow::anyhow!("SUS_POLICY set but {p} is missing/invalid JSON"))?)),
+            _ => None,
+        };
+        let sus_banner = match &sus {
+            Some(s) => format!("sus on (threshold {})", s.threshold),
+            None => "sus off".to_string(),
+        };
         let app = Router::new()
             .route("/health", get(health))
             .route("/triage", post(triage_endpoint))
             // 16 frames of full-res 4 MP JPEG fit comfortably; axum's 2 MB
             // default rejects multi-frame posts mid-stream (curl error 55).
             .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-            .with_state(AppState { session, pose, behavior });
+            .with_state(AppState { session, pose, behavior, sus });
         let addr = format!("0.0.0.0:{port}");
-        println!("motion-triage serving on {addr} (model {model}, pose {}, {})",
-                 if pose_on { "on" } else { "off" }, beh_banner);
+        println!("motion-triage serving on {addr} (model {model}, pose {}, {}, {})",
+                 if pose_on { "on" } else { "off" }, beh_banner, sus_banner);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
         return Ok(());
@@ -965,7 +1020,7 @@ async fn main() -> Result<()> {
     let input = args.get(2).map(String::as_str).unwrap_or("testdata/clip");
     let session = build_session(model)?;
     let frames = load_frames(input)?;
-    let r = run_triage(&session, &frames, &ZonesMeta::default(), None, None)?;
+    let r = run_triage(&session, &frames, &ZonesMeta::default(), None, None, false, None)?;
     println!("{} frames · detect {} ms ({:.1} ms/frame, CoreML) · {} track(s)",
         r.frames, r.detect_ms, r.detect_ms as f64 / r.frames.max(1) as f64, r.tracks.len());
     for v in &r.tracks {

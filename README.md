@@ -66,6 +66,20 @@ Composition is the whole point: `pacing` is benign at a storefront at noon and
 an alert at 3 a.m.; `pickup` inside a package zone is theft-shaped, on a loading
 dock it's a job. The NN supplies the verb; zones and hours supply the meaning.
 
+**Suspicion scoring** makes that composition concrete and tunable without
+retraining — every flag carries a weight, context multiplies it, a threshold
+fires it:
+
+```text
+sus = max(flag_weight[behavior], reason_weight[reason]) × night × zone   (→ [0,1])
+sus_alert = sus ≥ threshold
+```
+
+It's a plain JSON policy ([`service/sus_policy.example.json`](service/sus_policy.example.json)),
+emitted per track as `sus_score` / `sus_alert`. Walking weighs `0.0` — never
+suspicious on its own; a person *loitering at night* scores `1.0` and alerts,
+while the same person *standing briefly* scores `0.30` and doesn't.
+
 ## Architecture
 
 ```

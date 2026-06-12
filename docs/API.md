@@ -18,10 +18,11 @@ Run detection → tracking → pose → behavior over a frame sequence.
 
 ### Request — `multipart/form-data`
 
-| field   | type              | notes                                                                 |
-|---------|-------------------|-----------------------------------------------------------------------|
-| `frame` | jpeg (repeated)   | 1..N frames, time-ordered. Send **1** for the fast gate, **~16** for full triage. |
-| `zones` | json (optional)   | operator-drawn zones / lines, frame-fraction coords.                  |
+| field     | type              | notes                                                                 |
+|-----------|-------------------|-----------------------------------------------------------------------|
+| `frame`   | jpeg (repeated)   | 1..N frames, time-ordered. Send **1** for the fast gate, **~16** for full triage. |
+| `zones`   | json (optional)   | operator-drawn zones / lines, frame-fraction coords.                  |
+| `context` | json (optional)   | `{"night": true}` — site-local context for suspicion scoring. The caller knows its timezone; the service never guesses it from UTC frames. |
 
 `zones` payload:
 
@@ -54,6 +55,10 @@ know the camera's native resolution.
       "straightness": 0.21,
       "span": 0.08,
       "dwell_frac": 0.88,
+      "behavior": "pacing",
+      "behavior_conf": 0.91,
+      "sus_score": 1.0,
+      "sus_alert": true,
       "keypoints": [
         [[612.0, 410.0, 0.94], "… 17 COCO joints as [x, y, conf] …"],
         "… one entry per frame the track was seen …"
@@ -65,8 +70,30 @@ know the camera's native resolution.
 
 - `decision` — `"alert"` | `"dismiss"` (event-level: alert if **any** track alerts).
 - `reason` — the highest-severity track reason (see taxonomy).
+- `tracks[].behavior` / `behavior_conf` — the NN behavior flag + softmax
+  confidence. Present only when a `BEHAVIOR_MODEL` is loaded.
+- `tracks[].sus_score` / `sus_alert` — suspicion in `[0,1]` and whether it
+  crossed the policy threshold (see below). Present only when a `SUS_POLICY`
+  is loaded.
 - `tracks[].keypoints` — per-frame 17-joint skeletons, COCO order, `[x, y, conf]`
   in source-frame pixels. Omitted/empty until the pose layer ships.
+
+### Suspicion scoring
+
+Every behavior flag (and rule reason) carries a weight; context multiplies it;
+a threshold flags it:
+
+```text
+sus = max(flag_weight[behavior], reason_weight[reason])
+        × (night ? night_mult : 1)
+        × (in_zone ? zone_mult : 1)          # clamped to [0,1]
+sus_alert = sus >= threshold
+```
+
+`in_zone` is true when the track's footpoint falls inside an operator zone.
+The policy is a plain JSON file ([`service/sus_policy.example.json`](../service/sus_policy.example.json)) —
+the same `pacing` is benign at noon and an alert at 3 a.m., and that's tuned per
+site in seconds, not retrained. Walking weighs `0.0`: never suspicious on its own.
 
 ---
 
