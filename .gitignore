@@ -25,6 +25,11 @@ gifs/
 labels*.csv
 manifest*.csv
 !docs/**/*.png        # except diagrams checked into docs/
+# Curated, publishable demos ONLY (MEVA / CC BY 4.0 footage — never customer
+# clips). Everything under docs/demos/ is hand-picked and license-clean.
+!docs/demos/
+!docs/demos/*.gif
+!docs/demos/*.png
 
 # ── Rust ─────────────────────────────────────────────────────────────────────
 /target/

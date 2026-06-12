@@ -45,11 +45,19 @@ def main() -> int:
     p.add_argument("--model", required=True, help="behavior .onnx (sidecars next to it)")
     p.add_argument("--pose-model", default="yolo11n-pose.pt")
     p.add_argument("--out", required=True, help="annotated .mp4 to write")
+    p.add_argument("--gif", default=None,
+                   help="also write a compact looping GIF (README-embeddable)")
+    p.add_argument("--gif-width", type=int, default=480)
+    p.add_argument("--gif-fps", type=int, default=6)
+    p.add_argument("--gif-seconds", type=float, default=6.0,
+                   help="GIF length; frames evenly sampled across the whole clip")
     p.add_argument("--stills", default=None, help="also dump a few PNG stills here")
     p.add_argument("--device", default="cpu")
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--step", type=int, default=1, help="process every Nth frame")
+    p.add_argument("--max-frames", type=int, default=1200,
+                   help="cap frames held in memory (long clips OOM otherwise)")
     p.add_argument("--min-frames", type=int, default=6)
     args = p.parse_args()
 
@@ -70,7 +78,7 @@ def main() -> int:
     # Pass 1 — pose on every Nth frame, keep the raw frames for drawing.
     frames_bgr, dets_per_frame = [], []
     i = 0
-    while True:
+    while len(frames_bgr) < args.max_frames:
         ok, fr = cap.read()
         if not ok:
             break
@@ -126,6 +134,15 @@ def main() -> int:
         still_idxs = {ks[len(ks) // 4], ks[len(ks) // 2], ks[(3 * len(ks)) // 4]}
         Path(args.stills).mkdir(parents=True, exist_ok=True)
 
+    # GIF: sample evenly across the whole clip so the loop covers the action.
+    gif_keep: dict[int, int] = {}
+    gif_imgs: list = []
+    if args.gif:
+        n_gif = max(1, int(args.gif_fps * args.gif_seconds))
+        idxs = sorted({round(k * (len(frames_bgr) - 1) / max(1, n_gif - 1))
+                       for k in range(n_gif)})
+        gif_keep = {fi: i for i, fi in enumerate(idxs)}
+
     for fi, fr in enumerate(frames_bgr):
         for ti, (tr, label, conf) in enumerate(verdicts):
             det = tr.get(fi)
@@ -171,7 +188,25 @@ def main() -> int:
         vw.write(fr)
         if fi in still_idxs:
             cv2.imwrite(str(Path(args.stills) / f"{out_path.stem}_f{fi:03d}.png"), fr)
+        if fi in gif_keep:
+            gw = args.gif_width
+            gh = max(2, round(h * gw / w))
+            small = cv2.resize(fr, (gw, gh), interpolation=cv2.INTER_AREA)
+            from PIL import Image
+            gif_imgs.append((gif_keep[fi],
+                             Image.fromarray(small[:, :, ::-1])))  # BGR->RGB
     vw.release()
+
+    if args.gif and gif_imgs:
+        gif_imgs.sort(key=lambda t: t[0])
+        frames_pil = [im for _, im in gif_imgs]
+        gp = Path(args.gif)
+        gp.parent.mkdir(parents=True, exist_ok=True)
+        frames_pil[0].save(
+            gp, save_all=True, append_images=frames_pil[1:],
+            duration=int(1000 / args.gif_fps), loop=0, optimize=True)
+        print(f"wrote {gp}  ({len(frames_pil)} frames, {gp.stat().st_size/1e6:.2f} MB)")
+
     n_lab = len(verdicts)
     print(f"wrote {out_path} ({len(frames_bgr)} frames, {n_lab} classified track(s): "
           + ", ".join(f"{l} {c:.2f}" for _, l, c in verdicts) + ")")
