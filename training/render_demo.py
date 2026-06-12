@@ -144,6 +144,23 @@ def main() -> int:
                     continue
                 cv2.circle(fr, (x, y), th + 2,
                            JOINT_HI if c >= 0.5 else JOINT_LO, -1)
+            # Head-direction: red arrow from the nose along (nose − ear/eye
+            # midpoint) — which way the face points. No arrow when the nose
+            # is invisible (facing away from camera).
+            if len(pts) >= 5 and pts[0][2] >= KP_CONF:
+                ref = [p for p in (pts[3], pts[4]) if p[2] >= KP_CONF] \
+                    or [p for p in (pts[1], pts[2]) if p[2] >= KP_CONF]
+                if ref:
+                    rx = sum(p[0] for p in ref) / len(ref)
+                    ry = sum(p[1] for p in ref) / len(ref)
+                    dx, dy = pts[0][0] - rx, pts[0][1] - ry
+                    n = (dx * dx + dy * dy) ** 0.5
+                    if n >= 1:
+                        s = max(14.0, (y2 - y1) * 0.28) / n
+                        cv2.arrowedLine(
+                            fr, (pts[0][0], pts[0][1]),
+                            (int(pts[0][0] + dx * s), int(pts[0][1] + dy * s)),
+                            (0, 0, 255), th, tipLength=0.35)
             text = f"#{ti} {label} {conf:.2f}"
             scale = max(0.6, h / 900)
             (tw, tht), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, th)
