@@ -179,7 +179,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--clips", required=True, help="directory of video files")
     p.add_argument("--out", required=True, help="corpus JSONL to write")
-    p.add_argument("--model", default="yolo11n-pose.pt")
+    p.add_argument("--model", default="yolo26n-pose.pt",
+                   help="pose model — match the deployment's pose model so the "
+                        "behavior NN trains and serves on the same keypoints "
+                        "(production runs yolo26n-pose)")
     p.add_argument("--device", default="cpu", help="cpu / mps / cuda")
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--conf", type=float, default=0.25)

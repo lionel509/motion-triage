@@ -43,7 +43,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--clip", required=True)
     p.add_argument("--model", required=True, help="behavior .onnx (sidecars next to it)")
-    p.add_argument("--pose-model", default="yolo11n-pose.pt")
+    p.add_argument("--pose-model", default="yolo26n-pose.pt")
     p.add_argument("--out", required=True, help="annotated .mp4 to write")
     p.add_argument("--gif", default=None,
                    help="also write a compact looping GIF (README-embeddable)")
