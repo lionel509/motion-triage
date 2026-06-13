@@ -36,7 +36,16 @@ const PERSON_CLASS: usize = 0;
 // truck. (bicycle/1 is excluded — you don't "vanish into" a bike.) yolo11m
 // already emits these in the same forward pass; we just stop discarding them.
 const VEHICLE_CLASSES: [usize; 4] = [2, 3, 5, 7];
-const MAX_GAP: usize = 3;
+// A person briefly occluded (walks behind a shelf, another person, a sign) or
+// momentarily mis-detected used to break into TWO tracks at MAX_GAP=3 — and a
+// fragmented track reads as a fake reversal (pacing) or a mid-frame vanish
+// (intrusion). Hold tracks across a longer gap; the center-distance fallback
+// below also re-associates fast movers whose boxes don't overlap frame-to-frame.
+const MAX_GAP: usize = 8;
+// Center-distance fallback: when no box OVERLAPS (fast walker at 4-6 fps, or a
+// post-occlusion reappearance shifted over), match the nearest unused same-class
+// detection whose center is within this many of the track's last box-heights.
+const TRACK_DIST_BH: f32 = 1.2;
 
 // Phantom / distant-figure gates for the "soft" behaviors — the low-value,
 // FP-prone trajectory reads (loitering, pacing, u_turn, direction_change,
@@ -61,6 +70,14 @@ const DEAD_BOX_MOTION: f32 = 0.006; // total center path / frame-diagonal
 const DEAD_BOX_SCALE: f32 = 0.02;   // apparent-size change across the clip
 
 fn is_vehicle(c: usize) -> bool { VEHICLE_CLASSES.contains(&c) }
+
+/// A person box is taller-than-wide to roughly square; a box much WIDER than
+/// tall is a horizontal object (railing, counter edge, shelf lip) the detector
+/// mislabeled — a recurring false-track source on the store cams. Vehicles are
+/// legitimately wide, so this only screens the person class.
+fn implausible_person(d: &Det) -> bool {
+    d.cls == PERSON_CLASS && (d.x2 - d.x1) > 2.2 * (d.y2 - d.y1).max(1.0)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Det { x1: f32, y1: f32, x2: f32, y2: f32, score: f32, cls: usize }
@@ -176,6 +193,7 @@ fn detect(session: &Session, img: &image::RgbImage) -> Result<Vec<Det>> {
                 x2: (x2 - px) / scale, y2: (y2 - py) / scale, score, cls,
             });
         }
+        dets.retain(|d| !implausible_person(d));
         return Ok(dets); // model already applied NMS
     }
 
@@ -208,6 +226,7 @@ fn detect(session: &Session, img: &image::RgbImage) -> Result<Vec<Det>> {
         for k in &keep { if k.cls == d.cls && iou(&d, k) > IOU_NMS { continue 'o; } }
         keep.push(d);
     }
+    keep.retain(|d| !implausible_person(d));
     Ok(keep)
 }
 
@@ -223,6 +242,21 @@ fn track(frames: &[Vec<Det>]) -> Vec<Track> {
                 if used[di] || d.cls != t.cls { continue; } // never merge a person into a car track
                 let s = iou(&t.last, d);
                 if s > best.0 { best = (s, di); }
+            }
+            // Fallback: no box overlapped (fast mover / post-occlusion shift).
+            // Take the nearest unused same-class det within TRACK_DIST_BH of the
+            // last box-height — re-links the track instead of spawning a new one
+            // (which would read as a reversal/vanish). Distance, not IoU, so it
+            // survives a frame-to-frame jump bigger than a box.
+            if best.1 == usize::MAX {
+                let bh = (t.last.y2 - t.last.y1).max(1.0);
+                let (lcx, lcy) = (t.last.cx(), t.last.cy());
+                let mut bd = TRACK_DIST_BH * bh;
+                for (di, d) in dets.iter().enumerate() {
+                    if used[di] || d.cls != t.cls { continue; }
+                    let dist = ((d.cx() - lcx).powi(2) + (d.cy() - lcy).powi(2)).sqrt();
+                    if dist < bd { bd = dist; best.1 = di; }
+                }
             }
             if best.1 != usize::MAX {
                 let d = dets[best.1];
