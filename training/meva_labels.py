@@ -50,7 +50,12 @@ ACTIVITY_MAP = {
     "person_reading_document": "phone",
 }
 
-CLIP_RE = re.compile(r"^meva(?:carry)?_(\w+?)_(G\d+)__(\d{8})T(\d{6})Z")
+# Any meva<tag>_ prefix (meva_, mevacarry_, mevadoor_, mevaopens_, …); the
+# optional -<variant> suffix (rot/bright/lowlight) is tolerated but note that
+# ROTATED variants won't geometrically match the original KPF boxes — only
+# coordinate-preserving (lighting) variants should be geometrically matched.
+CLIP_RE = re.compile(
+    r"^meva(?:[a-z]+)?_([a-z]+)_(G\d+)(?:-[\w.-]+?)?__(\d{8})T(\d{6})Z")
 KPF_RE = re.compile(
     r"(\d{4}-\d{2}-\d{2})\.(\d{2})-(\d{2})-(\d{2})\.[\d-]+\.(\w+)\.(G\d+)[.-]activities\.yml$")
 

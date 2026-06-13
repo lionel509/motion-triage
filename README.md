@@ -48,19 +48,25 @@ the alert decision becomes a cheap rule (`flag × zone × hour`) instead of a sl
 model call. Flags graduate from *experimental* to *validated* only after they
 beat the per-class accuracy gate.
 
-| flag | source of labels | status |
-|------|------------------|--------|
-| walking | displacement + real corpus | ✅ validated (F1 ≈ 0.90) |
-| standing | displacement + real corpus | ✅ validated (F1 ≈ 0.77) |
-| pacing | movement-without-travel band | ✅ validated (F1 ≈ 0.58) |
-| pickup / set-down | MEVA KPF annotations | 🧪 experimental |
-| door interaction | MEVA KPF + operator zones | 🧪 experimental |
-| carrying | MEVA KPF annotations | 🔬 research — needs object detection¹ |
+Flags + held-out F1 as of **v1.1** (yolo26n-pose, ~6k labeled tracks; the
+3-class core ships, multi-flag rides informational until each flag is
+alert-grade):
 
-¹ Carrying is nearly indistinguishable from walking on the skeleton alone — you
-have to *see* the object. It's the worked example of where pose ends and
-detection begins; the fix is an "object-near-hands" feature from the detector,
-not more pose data.
+| flag | source of labels | v1.1 F1 |
+|------|------------------|---------|
+| standing | displacement + real corpus | **0.95** |
+| walking | displacement + real corpus | **0.92** |
+| carrying | MEVA KPF annotations | **0.89**¹ |
+| pickup / set-down | MEVA KPF annotations | **0.80** |
+| pacing | movement-without-travel band | **0.73** |
+| door interaction | targeted MEVA door pull + operator zones | **0.62**² |
+
+¹ Carrying looked hopeless at first (F1 0.00 — nearly indistinguishable from
+walking on the skeleton alone). It was a **data** problem, not a sensor one:
+a targeted pull of carrying-annotated clips took it to 0.89, no object
+detector needed. ² Door doubled (0.29 → 0.62) the same way — a targeted pull
+of door-opening clips. Both still climb with night data (see the lighting
+augmenter, `training/augment_clips.py`).
 
 Composition is the whole point: `pacing` is benign at a storefront at noon and
 an alert at 3 a.m.; `pickup` inside a package zone is theft-shaped, on a loading
@@ -129,7 +135,9 @@ better over time. The tier numbers track **capability**, not a model binary:
 | tier | demo | capability shown |
 |------|------|------------------|
 | v0.1 | `v0.1_walking_tracked.gif` | detect → track → pose → the validated core flags (walking / standing / pacing) |
-| v0.2 | `v0.2_multiflag_cafeteria.gif` | many people at once, head-direction arrows, and the experimental MEVA-trained flags (pickup / door / carrying) — not yet gate-passed |
+| v0.2 | `v0.2_multiflag_cafeteria.gif` | many people at once, head-direction arrows, and the first MEVA-trained flags |
+| v1.0 | — | 26n-pose parity model: macro-F1 0.907, **night 0.909** (night weakness closed); deployed live + suspicion scoring |
+| v1.1 | `v1.1_door.gif` | door-interaction flag working (0.62, 2×) + carrying rescued to 0.89 + pickup 0.80 — all six flags functional (multi-flag macro-F1 0.82) |
 
 ## The contract
 
