@@ -34,7 +34,12 @@ def main() -> int:
     p.add_argument("--max-gb", type=float, default=3.0)
     p.add_argument("--min-mb", type=float, default=20,
                    help="skip near-empty fragments")
-    p.add_argument("--max-mb", type=float, default=170)
+    p.add_argument("--max-mb", type=float, default=200)
+    p.add_argument("--activity", default=None,
+                   help="targeted mode: fetch only clips whose KPF annotations "
+                        "contain this activity (e.g. opens_facility_door, "
+                        "person_carries_heavy_object). Needs --kpf-root.")
+    p.add_argument("--kpf-root", default="data/meva-data-repo/annotation")
     args = p.parse_args()
 
     import boto3
@@ -47,6 +52,49 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     picked, per_cam = [], defaultdict(int)
     budget = args.max_gb * 1e9
+
+    # Targeted mode: fetch ONLY clips whose KPF annotations contain --activity.
+    # Far higher label yield than random dates for a specific behavior (the
+    # carrying/door classes were starved until pulled this way).
+    if args.activity:
+        hits = set()
+        for p in Path(args.kpf_root).rglob("*activities.yml"):
+            try:
+                if args.activity in p.read_text(encoding="utf-8", errors="ignore"):
+                    hits.add(re.sub(r"[.-]activities\.yml$", "", p.name))
+            except OSError:
+                pass
+        print(f"clips annotated with '{args.activity}': {len(hits)}")
+        kpf_name = re.compile(r"(\d{4}-\d{2}-\d{2})\.(\d{2})-(\d{2})-(\d{2})\.[\d-]+\.(\w+)\.(G\d+)$")
+        for stem in sorted(hits):
+            if len(picked) >= args.max_clips or sum(s for _, s, _ in picked) >= budget:
+                break
+            km = kpf_name.match(stem)
+            if not km:
+                continue
+            key = f"drops-123-r13/{km.group(1)}/{km.group(2)}/{stem}.r13.avi"
+            try:
+                size = s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"]
+            except Exception:  # noqa: BLE001 — not all annotated clips are in this drop
+                continue
+            if not (args.min_mb * 1e6 <= size <= args.max_mb * 1e6):
+                continue
+            d8 = km.group(1).replace("-", "")
+            tag = args.activity.replace("person_", "").split("_")[0]
+            dest = out / (f"meva{tag}_{km.group(5)}_{km.group(6)}"
+                          f"__{d8}T{km.group(2)}{km.group(3)}{km.group(4)}Z.avi")
+            picked.append((key, size, dest))
+        total = sum(s for _, s, _ in picked)
+        print(f"selected {len(picked)} clips, {total/1e9:.2f} GB — downloading")
+        for i, (key, size, dest) in enumerate(picked, 1):
+            if dest.exists() and dest.stat().st_size == size:
+                continue
+            s3.download_file(BUCKET, key, str(dest))
+            if i % 10 == 0 or i == len(picked):
+                print(f"  [{i}/{len(picked)}] {total/1e9:.2f} GB")
+        print(f"done -> {out}  (MEVA, CC BY 4.0)")
+        return 0
+
     for date in args.dates:
         token, kwargs = True, {"Bucket": BUCKET, "Prefix": f"drops-123-r13/{date}/"}
         while token:

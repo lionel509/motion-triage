@@ -50,3 +50,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# deployment-specific glue (hardcoded Mac paths) — not for the public repo
+training/run_training_batch.sh
