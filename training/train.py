@@ -112,6 +112,13 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, help="cpu/cuda/mps (default auto)")
     p.add_argument("--out", default="models/behavior.onnx")
+    p.add_argument("--augment", action="store_true",
+                   help="train-time skeleton augmentation: rotation (camera "
+                        "angles) + per-joint confidence dropout (night/IR)")
+    p.add_argument("--aug-rot-deg", type=float, default=15.0,
+                   help="max random in-plane rotation, degrees")
+    p.add_argument("--aug-conf-drop", type=float, default=0.1,
+                   help="per-joint dropout prob (simulates low visibility)")
     args = p.parse_args()
 
     try:
@@ -203,6 +210,38 @@ def main() -> int:
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ---- Train --------------------------------------------------------------
+    # ---- Train-time skeleton augmentation (different angles + lighting) -----
+    # Channels per joint: [x, y, conf, vel, gdx, gdy]. Rotate (x,y) around the
+    # skeleton centroid and the global-motion (gdx,gdy) by a per-sample random
+    # angle → the model sees every track at varied camera angles. Randomly drop
+    # joints' local channels → simulates night/IR low visibility. Velocity is a
+    # magnitude (rotation-invariant), left as-is. Fresh per batch each epoch,
+    # train split only — val stays clean. Free + scales to all data (no re-encode).
+    def augment_batch(xb):
+        bsz = xb.shape[0]
+        rad = args.aug_rot_deg * 3.14159265 / 180.0
+        ang = (torch.rand(bsz, device=xb.device) * 2 - 1) * rad
+        cos = torch.cos(ang).view(bsz, 1, 1)
+        sin = torch.sin(ang).view(bsz, 1, 1)
+        xb = xb.clone()
+        x, y, conf = xb[..., 0], xb[..., 1], xb[..., 2]
+        valid = conf > 0
+        vf = valid.float()
+        cnt = vf.flatten(1).sum(1).clamp(min=1.0)
+        cx = ((x * vf).flatten(1).sum(1) / cnt).view(bsz, 1, 1)
+        cy = ((y * vf).flatten(1).sum(1) / cnt).view(bsz, 1, 1)
+        dx, dy = x - cx, y - cy
+        xb[..., 0] = torch.where(valid, cx + dx * cos - dy * sin, x)
+        xb[..., 1] = torch.where(valid, cy + dx * sin + dy * cos, y)
+        gdx, gdy = xb[..., 4].clone(), xb[..., 5].clone()
+        xb[..., 4] = gdx * cos - gdy * sin
+        xb[..., 5] = gdx * sin + gdy * cos
+        if args.aug_conf_drop > 0:
+            drop = (torch.rand_like(conf) < args.aug_conf_drop) & valid
+            for ch in (0, 1, 2, 3):
+                xb[..., ch] = torch.where(drop, torch.zeros_like(xb[..., ch]), xb[..., ch])
+        return xb
+
     n = len(xtr)
     for epoch in range(args.epochs):
         model.train()
@@ -210,7 +249,10 @@ def main() -> int:
         total = 0.0
         for i in range(0, n, args.batch):
             idx = perm[i:i + args.batch]
-            xb, yb = xtr[idx].to(device), ytr[idx].to(device)
+            xb = xtr[idx].to(device)
+            if args.augment:
+                xb = augment_batch(xb)
+            yb = ytr[idx].to(device)
             opt.zero_grad()
             loss = crit(model(xb), yb)
             loss.backward()
