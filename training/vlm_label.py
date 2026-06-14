@@ -262,8 +262,10 @@ def vlm_label(model: str, frame_paths: list[str]) -> dict:
         "suspicious": bool(parsed.get("suspicious")),
         "weapon_visible": weapon,
         "threat": threat,
-        "reason": parsed.get("reason", ""),
-        "description": parsed.get("description", ""),
+        # NN output is structured CLASSES only — not an LLM, no generated prose.
+        # The teacher's free-text reason/description stays in vlm_raw for human
+        # audit of labels; it is NEVER a training target or a product output.
+        # (Future idea: a tiny distilled caption head on the NN for a sentence.)
         "vlm_raw": parsed,
     }
 

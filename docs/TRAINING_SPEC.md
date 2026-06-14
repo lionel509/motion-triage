@@ -28,6 +28,16 @@ It's a stack of heads, each its own training problem with its own labels.
 Student NN's primary job = **behavior + verdict + activity + pose** heads.
 Attribute/scene heads can stay with the VLM longer.
 
+> **Output contract — the NN emits CLASSES, not prose.** The model is not an LLM;
+> it outputs the structured heads above (verdict, behaviors, activities, scene,
+> severity, confidences). Human-readable alert text is built **deterministically
+> from a template** filled by those classes (e.g. "Door entry · front door ·
+> 9:18 PM"), never a generated sentence. The VLM teacher's free-text
+> reason/description is **label-audit metadata only** (kept under `vlm_raw`), never
+> a training target or a product output. *Future option:* distill a tiny caption
+> head onto the NN if a one-line natural-language summary is ever wanted — out of
+> scope for v1.
+
 ## PART B — 21 behavior labels (canonical, `workers/scene_classifier.py:28`)
 
 **Threat — never-miss (keep ungated, fire even at low conf / bad light):**
