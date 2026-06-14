@@ -25,7 +25,20 @@ from botocore.client import Config
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 40
 OUTDIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
     os.path.expanduser("~"), "flywheel_batch")
+# mode: signal (suspicious+person first) | recent (pure recency) | door
+# (door/residential-biased, to grow the starved door class).
+MODE = sys.argv[3] if len(sys.argv) > 3 else "signal"
 os.makedirs(OUTDIR, exist_ok=True)
+
+ORDER = {
+    "signal": "order by (llm_verdict = 'suspicious') desc, "
+              "(event_subtype in ('human_body','vehicle_detected')) desc, received_at desc",
+    "recent": "order by received_at desc",
+    "door": "order by (task_category ilike '%door%') desc, "
+            "(anomaly_reason ilike '%door%') desc, "
+            "(camera_label ilike 'House%' or camera_label ilike 'Brooklyn%') desc, "
+            "received_at desc",
+}.get(MODE, "order by received_at desc")
 
 
 def _connect():
@@ -42,14 +55,12 @@ def _connect():
 conn = _connect()
 cur = conn.cursor()
 cur.execute(
-    """
+    f"""
     select id, camera_label, channel, event_time_utc, event_subtype,
            llm_verdict, task_category, anomaly_reason, clip_s3_key
     from events
     where clip_s3_key is not null and status = 'processed'
-    order by (llm_verdict = 'suspicious') desc,
-             (event_subtype in ('human_body', 'vehicle_detected')) desc,
-             received_at desc
+    {ORDER}
     limit %s
     """,
     (N,),
