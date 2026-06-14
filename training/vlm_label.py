@@ -290,16 +290,36 @@ def main() -> int:
         rec["source"] = os.path.basename(args.clip)
         records.append(rec)
     elif args.clips_dir:
-        for clip in sorted(Path(args.clips_dir).glob("*.mp4")):
+        # Incremental write + resume (overnight resilience): each label is flushed
+        # to --out as produced, and clips already present in --out are skipped, so
+        # a crash mid-run loses nothing and a re-run continues where it stopped.
+        done = set()
+        if args.out and os.path.exists(args.out):
+            for line in open(args.out, encoding="utf-8"):
+                try:
+                    done.add(json.loads(line).get("source"))
+                except json.JSONDecodeError:
+                    pass
+        out_fh = open(args.out, "a", encoding="utf-8") if args.out else None
+        clips = sorted(Path(args.clips_dir).glob("*.mp4"))
+        for clip in clips:
+            if clip.name in done:
+                continue
             try:
                 rec = vlm_label(args.model, sample_frames(str(clip), args.n_frames))
             except Exception as exc:  # noqa: BLE001
                 rec = {"error": str(exc)}
             rec["source"] = clip.name
-            records.append(rec)
+            if out_fh:
+                out_fh.write(json.dumps(rec) + "\n")
+                out_fh.flush()
             print(f"{clip.name}: verdict={rec.get('verdict')} "
                   f"beh={rec.get('behaviors')} act={rec.get('activities')} "
                   f"scene={rec.get('scene')} threat={rec.get('threat')}", flush=True)
+        if out_fh:
+            out_fh.close()
+        print(f"done: {len(clips)} clips ({len(done)} pre-existing skipped)", flush=True)
+        return 0
     else:
         ap.error("need --clip, --frames, or --clips-dir")
 
