@@ -137,7 +137,7 @@ better over time. The tier numbers track **capability**, not a model binary:
 | v0.1 | `v0.1_walking_tracked.gif` | detect → track → pose → the validated core flags (walking / standing / pacing) |
 | v0.2 | `v0.2_multiflag_cafeteria.gif` | many people at once, head-direction arrows, and the first MEVA-trained flags |
 | v1.0 | — | 26n-pose parity model: macro-F1 0.907, **night 0.909** (night weakness closed); deployed live + suspicion scoring |
-| v1.1 | `v1.1_door.gif` | door-interaction flag working (0.62, 2×) + carrying rescued to 0.89 + pickup 0.80 — all six flags functional (multi-flag macro-F1 0.82) |
+| v1.1 | — | carrying 0.89 + pickup 0.80 — six behavior flags functional (multi-flag macro-F1 0.82). Clean demo GIFs are being regenerated with the higher-confidence pipeline; the `door` flag is weak (F1 0.62) and was phantom-firing on bright spots / low-confidence detections, now being hardened. |
 
 ## The contract
 

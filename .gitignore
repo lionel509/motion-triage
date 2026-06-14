@@ -53,3 +53,10 @@ venv/
 
 # deployment-specific glue (hardcoded Mac paths) — not for the public repo
 training/run_training_batch.sh
+
+# flywheel: never commit model backups or customer data to the public repo
+backups/
+*.tar
+*.tgz
+data/clips/
+flywheel_*/
