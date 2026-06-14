@@ -38,6 +38,11 @@ ORDER = {
             "(anomaly_reason ilike '%door%') desc, "
             "(camera_label ilike 'House%' or camera_label ilike 'Brooklyn%') desc, "
             "received_at desc",
+    # person: prioritize confirmed-person events (human_body subtype / person
+    # subject) for bulk people-walking training. Prelabel (not the VLM) labels
+    # these, so we can scale to thousands without the labeling bottleneck.
+    "person": "order by (event_subtype = 'human_body') desc, "
+              "(llm_primary_subject = 'person') desc, received_at desc",
 }.get(MODE, "order by received_at desc")
 
 
