@@ -43,7 +43,16 @@ ORDER = {
     # these, so we can scale to thousands without the labeling bottleneck.
     "person": "order by (event_subtype = 'human_body') desc, "
               "(llm_primary_subject = 'person') desc, received_at desc",
+    # person_diverse: random cross-section of confirmed-person events (varied
+    # cameras / times / day-night) — broadens the model beyond recent street cams.
+    "person_diverse": "order by random()",
 }.get(MODE, "order by received_at desc")
+
+# Per-mode extra WHERE filter (person_diverse must restrict to person events,
+# since a random sample of all events would be mostly empty weather_motion).
+WHERE_EXTRA = {
+    "person_diverse": " and (event_subtype = 'human_body' or llm_primary_subject = 'person')",
+}.get(MODE, "")
 
 
 def _connect():
@@ -64,7 +73,7 @@ cur.execute(
     select id, camera_label, channel, event_time_utc, event_subtype,
            llm_verdict, task_category, anomaly_reason, clip_s3_key
     from events
-    where clip_s3_key is not null and status = 'processed'
+    where clip_s3_key is not null and status = 'processed'{WHERE_EXTRA}
     {ORDER}
     limit {int(N)}
     """
