@@ -61,9 +61,8 @@ cur.execute(
     from events
     where clip_s3_key is not null and status = 'processed'
     {ORDER}
-    limit %s
-    """,
-    (N,),
+    limit {int(N)}
+    """
 )
 rows = cur.fetchall()
 cur.close()
