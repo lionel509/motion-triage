@@ -21,6 +21,9 @@ use serde::Deserialize;
 
 fn one() -> f32 { 1.0 }
 fn default_threshold() -> f32 { 0.7 }
+fn default_review_at() -> f32 { 0.40 }
+fn default_alert_at() -> f32 { 0.85 }
+fn default_conf_floor() -> f32 { 0.50 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct SusPolicy {
@@ -35,8 +38,32 @@ pub struct SusPolicy {
     pub night_mult: f32,
     #[serde(default = "one")]
     pub zone_mult: f32,
+    /// Legacy single line for the boolean `sus_alert` field (score >= threshold).
+    /// Kept for back-compat; the three-way `route` uses review_at/alert_at below.
     #[serde(default = "default_threshold")]
     pub threshold: f32,
+    /// Below this the event is not worth anyone's time → dismiss.
+    #[serde(default = "default_review_at")]
+    pub review_at: f32,
+    /// At/above this AND the NN is confident → fire now (no VLM round-trip).
+    #[serde(default = "default_alert_at")]
+    pub alert_at: f32,
+    /// A behavior-NN classification below this confidence is "unsure": a would-be
+    /// alert is demoted to the VLM (quality check) instead of firing blind.
+    #[serde(default = "default_conf_floor")]
+    pub conf_floor: f32,
+}
+
+/// Three-way routing outcome (string-serialized in the verdict).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Route { Alert, Vlm, Dismiss }
+
+impl Route {
+    pub fn as_str(self) -> &'static str {
+        match self { Route::Alert => "alert", Route::Vlm => "vlm", Route::Dismiss => "dismiss" }
+    }
+    /// Severity order for aggregating many tracks into one event route.
+    pub fn rank(self) -> u8 { match self { Route::Dismiss => 0, Route::Vlm => 1, Route::Alert => 2 } }
 }
 
 impl SusPolicy {
@@ -63,6 +90,20 @@ impl SusPolicy {
         let s = s.clamp(0.0, 1.0);
         (s, s >= self.threshold)
     }
+
+    /// Route a graded track three ways from its sus score + the NN's confidence
+    /// in the behavior it classified (None when no behavior NN ran — then we
+    /// trust the score alone).
+    ///
+    /// - `sus >= alert_at` **and** the NN is sure → `Alert` (fire now).
+    /// - unsure NN, or `review_at <= sus < alert_at` → `Vlm` (manager checks).
+    /// - `sus < review_at` → `Dismiss` (a street walker scores ~0 here).
+    pub fn route(&self, sus: f32, behavior_conf: Option<f32>) -> Route {
+        let sure = behavior_conf.map_or(true, |c| c >= self.conf_floor);
+        if sus >= self.alert_at && sure { Route::Alert }
+        else if sus >= self.review_at { Route::Vlm }
+        else { Route::Dismiss }
+    }
 }
 
 #[cfg(test)]
@@ -78,7 +119,25 @@ mod tests {
             night_mult: 2.0,
             zone_mult: 1.5,
             threshold: 0.7,
+            review_at: 0.40,
+            alert_at: 0.85,
+            conf_floor: 0.50,
         }
+    }
+
+    #[test]
+    fn route_bands_relevance_then_confidence() {
+        let p = policy();
+        // street walker: sus 0 → dismiss, no matter how sure the box was.
+        assert_eq!(p.route(0.0, Some(0.99)), Route::Dismiss);
+        // ambiguous loiter (0.7) → manager checks.
+        assert_eq!(p.route(0.70, None), Route::Vlm);
+        // high relevance + confident NN → fire now.
+        assert_eq!(p.route(0.95, Some(0.90)), Route::Alert);
+        // high relevance but the NN is unsure → demote to VLM, don't fire blind.
+        assert_eq!(p.route(0.95, Some(0.30)), Route::Vlm);
+        // high relevance, no behavior NN ran (hard geometry) → trust the score.
+        assert_eq!(p.route(0.95, None), Route::Alert);
     }
 
     #[test]

@@ -307,7 +307,12 @@ struct TrackVerdict { id: usize, n: usize, straightness: f32, span: f32, dwell_f
     #[serde(skip_serializing_if = "Option::is_none")]
     sus_score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    sus_alert: Option<bool> }
+    sus_alert: Option<bool>,
+    // Three-way routing for this track: "alert" (fire now) | "vlm" (manager
+    // quality-checks the unsure middle) | "dismiss". Additive; only emitted once
+    // routing has run. The event-level route is the most severe across tracks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<String> }
 
 /// Is this person box at/adjacent to any vehicle box? True on real overlap, or
 /// when the person's center sits within a vehicle box expanded by ~8% of the
@@ -604,11 +609,24 @@ fn classify(t: &Track, total_frames: usize, w: f32, h: f32, vehicles: &[Det]) ->
     (decision, TrackVerdict { id: t.id, n, straightness, span, dwell_frac,
         decision: decision.as_str().into(), reason: reason.into(),
         keypoints: Vec::new(), behavior: None, behavior_conf: None,
-        sus_score: None, sus_alert: None })
+        sus_score: None, sus_alert: None, route: None })
 }
 
 #[derive(Serialize)]
-struct TriageResult { decision: String, reason: String, detect_ms: u64, frames: usize, tracks: Vec<TrackVerdict> }
+struct TriageResult { decision: String, route: String, reason: String, detect_ms: u64, frames: usize, tracks: Vec<TrackVerdict> }
+
+/// Route ONE person track: urgent break-in shapes (severity ≥ 8) fire now; the
+/// rest go through the relevance×confidence bands; a geometry/behavior alert the
+/// policy didn't grade still floors at VLM so a flagged event never silently drops.
+fn route_track(decision: &Decision, reason: &str, sus_score: Option<f32>,
+               behavior_conf: Option<f32>, pol: Option<&sus::SusPolicy>) -> sus::Route {
+    if reason_severity(reason) >= 8 { return sus::Route::Alert; }
+    let banded = match (pol, sus_score) {
+        (Some(p), Some(s)) => p.route(s, behavior_conf),
+        _ => sus::Route::Dismiss,
+    };
+    if banded == sus::Route::Dismiss && *decision == Decision::Alert { sus::Route::Vlm } else { banded }
+}
 
 fn reason_severity(r: &str) -> u8 {
     match r {
@@ -760,7 +778,7 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
               pose_session: Option<&Session>, beh: Option<&BehaviorCtx>,
               night: bool, sus_policy: Option<&sus::SusPolicy>) -> Result<TriageResult> {
     if frames.is_empty() {
-        return Ok(TriageResult { decision: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, tracks: vec![] });
+        return Ok(TriageResult { decision: "dismiss".into(), route: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, tracks: vec![] });
     }
     let (w, h) = (frames[0].width() as f32, frames[0].height() as f32);
     let t0 = Instant::now();
@@ -867,31 +885,46 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
             v.sus_score = Some((s * 1000.0).round() / 1000.0);
             v.sus_alert = Some(a);
         }
+        // Three-way route: relevance × confidence, with the urgent override.
+        v.route = Some(route_track(&d, &v.reason, v.sus_score, v.behavior_conf, sus_policy)
+            .as_str().into());
         decisions.push(d); verdicts.push(v);
     }
     // Event-level signals (multiple people / converging) over the full track set.
+    // Soft signals → the manager (VLM) judges; two people near each other isn't
+    // an emergency on its own.
     if let Some(reason) = event_level(&tracks, w, h) {
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
             dwell_frac: 0.0, decision: "alert".into(), reason: reason.into(),
             keypoints: Vec::new(), behavior: None, behavior_conf: None,
-            sus_score: None, sus_alert: None });
+            sus_score: None, sus_alert: None, route: Some("vlm".into()) });
     }
     // Zone / door analytics (operator-drawn zones + lines, if any were POSTed).
+    // The operator drew that boundary deliberately → crossing it IS the alert.
     if let Some(reason) = zone_line_reason(&tracks, w, h, meta) {
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
             dwell_frac: 0.0, decision: "alert".into(), reason: reason.into(),
             keypoints: Vec::new(), behavior: None, behavior_conf: None,
-            sus_score: None, sus_alert: None });
+            sus_score: None, sus_alert: None, route: Some("alert".into()) });
     }
     let event = if decisions.iter().any(|d| *d == Decision::Alert) { Decision::Alert } else { Decision::Dismiss };
+    // Event route = the most severe track route (alert > vlm > dismiss).
+    let event_route = verdicts.iter()
+        .filter_map(|v| v.route.as_deref())
+        .map(|r| match r { "alert" => sus::Route::Alert, "vlm" => sus::Route::Vlm, _ => sus::Route::Dismiss })
+        .max_by_key(|r| r.rank())
+        .unwrap_or(if event == Decision::Alert { sus::Route::Alert } else { sus::Route::Dismiss });
+    // Event reason = highest-severity reason among tracks that aren't dismissed,
+    // so the headline reason matches what actually drove the route.
     let reason = verdicts.iter()
-        .filter(|v| v.decision == "alert")
+        .filter(|v| v.route.as_deref() != Some("dismiss") && v.decision == "alert")
         .max_by_key(|v| reason_severity(&v.reason))
         .map(|v| v.reason.clone())
         .unwrap_or_else(|| "none".into());
-    Ok(TriageResult { decision: event.as_str().into(), reason, detect_ms: det_ms, frames: frames.len(), tracks: verdicts })
+    Ok(TriageResult { decision: event.as_str().into(), route: event_route.as_str().into(),
+        reason, detect_ms: det_ms, frames: frames.len(), tracks: verdicts })
 }
 
 fn build_session(model: &str) -> Result<Session> {

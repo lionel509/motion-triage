@@ -1,5 +1,5 @@
 {
-  "_comment": "Suspicion policy: sus = max(flag_weight[behavior], reason_weight[reason]) x (night?night_mult:1) x (in_zone?zone_mult:1), clamped to [0,1]; alert = sus >= threshold. Tune per site — the same pacing is benign at noon and an alert at 3am. Copy to sus_policy.json and point SUS_POLICY at it.",
+  "_comment": "Suspicion policy: sus = max(flag_weight[behavior], reason_weight[reason]) x (night?night_mult:1) x (in_zone?zone_mult:1), clamped to [0,1]. ROUTE (3-way): sus>=alert_at AND NN sure -> alert (fire now); review_at<=sus<alert_at OR unsure NN -> vlm (manager checks); sus<review_at -> dismiss. sus_alert (legacy bool) = sus>=threshold. Tune per site — the same pacing is benign at noon and an alert at 3am. Copy to sus_policy.json and point SUS_POLICY at it.",
 
   "flag_weight": {
     "walking": 0.0,
@@ -7,7 +7,9 @@
     "pacing": 0.5,
     "carrying": 0.4,
     "pickup": 0.5,
-    "door": 0.6
+    "door": 0.6,
+    "running": 0.7,
+    "crouching": 0.6
   },
 
   "reason_weight": {
@@ -17,9 +19,10 @@
     "sudden_stop": 0.5,
     "u_turn": 0.6,
     "multi_person": 0.6,
-    "camera_approach": 0.8,
-    "door_entry": 0.75,
-    "zone_intrusion": 0.85,
+    "scaling": 0.85,
+    "camera_approach": 0.9,
+    "door_entry": 0.85,
+    "zone_intrusion": 0.9,
     "intrusion": 0.95,
     "entered_vehicle": 0.85,
     "arrived_by_vehicle": 0.5
@@ -27,5 +30,8 @@
 
   "night_mult": 2.0,
   "zone_mult": 1.5,
-  "threshold": 0.7
+  "threshold": 0.7,
+  "review_at": 0.40,
+  "alert_at": 0.85,
+  "conf_floor": 0.50
 }
