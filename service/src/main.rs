@@ -288,6 +288,12 @@ impl Decision {
 
 #[derive(Serialize)]
 struct TrackVerdict { id: usize, n: usize, straightness: f32, span: f32, dwell_frac: f32,
+    // Absolute dwell estimate in seconds: dwell_frac × the clip window length
+    // (clip_seconds in the POSTed context, default 60). The operator reads this
+    // directly — <10s = passing through (ignore), ~minute = loitering. Additive;
+    // present whenever clip_seconds is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dwell_s: Option<f32>,
     decision: String, reason: String,
     // 17-COCO-joint skeletons, one entry per frame the track was seen (null
     // where pose found no match) — populated only when POSE_MODEL is set.
@@ -606,14 +612,45 @@ fn classify(t: &Track, total_frames: usize, w: f32, h: f32, vehicles: &[Det]) ->
     } else {
         (Decision::Dismiss, "walk_by") // moving through / past = normal
     };
-    (decision, TrackVerdict { id: t.id, n, straightness, span, dwell_frac,
+    (decision, TrackVerdict { id: t.id, n, straightness, span, dwell_frac, dwell_s: None,
         decision: decision.as_str().into(), reason: reason.into(),
         keypoints: Vec::new(), behavior: None, behavior_conf: None,
         sus_score: None, sus_alert: None, route: None })
 }
 
 #[derive(Serialize)]
-struct TriageResult { decision: String, route: String, reason: String, detect_ms: u64, frames: usize, tracks: Vec<TrackVerdict> }
+struct TriageResult { decision: String, route: String, reason: String, detect_ms: u64, frames: usize,
+    // Raw NN one-liner for the operator (NO prose): person count, per-person
+    // behavior + confidence% + dwell estimate + route. Built by nn_summary().
+    summary: String,
+    tracks: Vec<TrackVerdict> }
+
+/// Compact raw-NN summary the operator reads directly — no sentence-building.
+/// e.g. "2 ppl | #1 pacing 87% ~52s →alert | #2 walk_by 3% ~4s →dismiss | +multi_person →vlm"
+/// Real tracks (id != usize::MAX) carry behavior/conf/dwell; synthetic
+/// event-level verdicts (multi-person, zone/line) are appended as "+reason →route".
+fn nn_summary(verdicts: &[TrackVerdict]) -> String {
+    let people: Vec<&TrackVerdict> = verdicts.iter().filter(|v| v.id != usize::MAX).collect();
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("{} ppl", people.len()));
+    for (i, v) in people.iter().enumerate() {
+        // What the NN actually said: the classified behavior if present, else the
+        // geometric reason. Confidence% = behavior_conf when classified, else the
+        // sus score (both already in [0,1]); "--" when neither ran.
+        let label = v.behavior.as_deref().unwrap_or(&v.reason);
+        let conf = v.behavior_conf.or(v.sus_score)
+            .map(|c| format!("{}%", (c * 100.0).round() as i32))
+            .unwrap_or_else(|| "--%".into());
+        let dwell = v.dwell_s.map(|s| format!(" ~{}s", s.round() as i32)).unwrap_or_default();
+        let route = v.route.as_deref().unwrap_or(&v.decision);
+        parts.push(format!("#{} {} {}{} \u{2192}{}", i + 1, label, conf, dwell, route));
+    }
+    for v in verdicts.iter().filter(|v| v.id == usize::MAX) {
+        let route = v.route.as_deref().unwrap_or(&v.decision);
+        parts.push(format!("+{} \u{2192}{}", v.reason, route));
+    }
+    parts.join(" | ")
+}
 
 /// Route ONE person track: urgent break-in shapes (severity ≥ 8) fire now; the
 /// rest go through the relevance×confidence bands; a geometry/behavior alert the
@@ -776,9 +813,10 @@ fn foot_in_zone(foot: (f32, f32), w: f32, h: f32, meta: &ZonesMeta) -> bool {
 
 fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
               pose_session: Option<&Session>, beh: Option<&BehaviorCtx>,
-              night: bool, sus_policy: Option<&sus::SusPolicy>) -> Result<TriageResult> {
+              night: bool, sus_policy: Option<&sus::SusPolicy>,
+              clip_seconds: f32) -> Result<TriageResult> {
     if frames.is_empty() {
-        return Ok(TriageResult { decision: "dismiss".into(), route: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, tracks: vec![] });
+        return Ok(TriageResult { decision: "dismiss".into(), route: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, summary: "0 ppl".into(), tracks: vec![] });
     }
     let (w, h) = (frames[0].width() as f32, frames[0].height() as f32);
     let t0 = Instant::now();
@@ -888,6 +926,9 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
         // Three-way route: relevance × confidence, with the urgent override.
         v.route = Some(route_track(&d, &v.reason, v.sus_score, v.behavior_conf, sus_policy)
             .as_str().into());
+        // Absolute dwell estimate the operator reads directly (frames are sampled
+        // across the clip window, so dwell_frac × clip_seconds ≈ seconds present).
+        v.dwell_s = Some((v.dwell_frac * clip_seconds * 10.0).round() / 10.0);
         decisions.push(d); verdicts.push(v);
     }
     // Event-level signals (multiple people / converging) over the full track set.
@@ -896,7 +937,7 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
     if let Some(reason) = event_level(&tracks, w, h) {
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
-            dwell_frac: 0.0, decision: "alert".into(), reason: reason.into(),
+            dwell_frac: 0.0, dwell_s: None, decision: "alert".into(), reason: reason.into(),
             keypoints: Vec::new(), behavior: None, behavior_conf: None,
             sus_score: None, sus_alert: None, route: Some("vlm".into()) });
     }
@@ -905,7 +946,7 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
     if let Some(reason) = zone_line_reason(&tracks, w, h, meta) {
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
-            dwell_frac: 0.0, decision: "alert".into(), reason: reason.into(),
+            dwell_frac: 0.0, dwell_s: None, decision: "alert".into(), reason: reason.into(),
             keypoints: Vec::new(), behavior: None, behavior_conf: None,
             sus_score: None, sus_alert: None, route: Some("alert".into()) });
     }
@@ -923,8 +964,9 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
         .max_by_key(|v| reason_severity(&v.reason))
         .map(|v| v.reason.clone())
         .unwrap_or_else(|| "none".into());
+    let summary = nn_summary(&verdicts);
     Ok(TriageResult { decision: event.as_str().into(), route: event_route.as_str().into(),
-        reason, detect_ms: det_ms, frames: frames.len(), tracks: verdicts })
+        reason, detect_ms: det_ms, frames: frames.len(), summary, tracks: verdicts })
 }
 
 fn build_session(model: &str) -> Result<Session> {
@@ -968,6 +1010,9 @@ async fn triage_endpoint(State(st): State<AppState>, mut mp: Multipart) -> Json<
     let mut frame_bytes: Vec<Vec<u8>> = Vec::new();
     let mut meta = ZonesMeta::default();
     let mut night = false;
+    // Clip window length the frames were sampled from (seconds). Drives the
+    // dwell_s estimate. Default 60 (the validated capture window).
+    let mut clip_seconds: f32 = 60.0;
     while let Ok(Some(field)) = mp.next_field().await {
         let name = field.name().map(|s| s.to_string());
         let Ok(b) = field.bytes().await else { continue };
@@ -981,6 +1026,9 @@ async fn triage_endpoint(State(st): State<AppState>, mut mp: Multipart) -> Json<
                 // time; we don't guess timezone from UTC frames.
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
                     night = v.get("night").and_then(|x| x.as_bool()).unwrap_or(false);
+                    if let Some(cs) = v.get("clip_seconds").and_then(|x| x.as_f64()) {
+                        if cs > 0.0 { clip_seconds = cs as f32; }
+                    }
                 }
             }
             _ => frame_bytes.push(b.to_vec()),
@@ -994,7 +1042,7 @@ async fn triage_endpoint(State(st): State<AppState>, mut mp: Multipart) -> Json<
         let s = st.session.lock().unwrap();
         let pose_guard = st.pose.as_ref().map(|p| p.lock().unwrap());
         run_triage(&s, &frames, &meta, pose_guard.as_deref(), st.behavior.as_deref(),
-                   night, st.sus.as_deref())
+                   night, st.sus.as_deref(), clip_seconds)
     }).await;
     // On ANY failure, fail safe → escalate (let the VLM decide rather than drop).
     match res {
@@ -1087,7 +1135,7 @@ async fn main() -> Result<()> {
     let input = args.get(2).map(String::as_str).unwrap_or("testdata/clip");
     let session = build_session(model)?;
     let frames = load_frames(input)?;
-    let r = run_triage(&session, &frames, &ZonesMeta::default(), None, None, false, None)?;
+    let r = run_triage(&session, &frames, &ZonesMeta::default(), None, None, false, None, 60.0)?;
     println!("{} frames · detect {} ms ({:.1} ms/frame, CoreML) · {} track(s)",
         r.frames, r.detect_ms, r.detect_ms as f64 / r.frames.max(1) as f64, r.tracks.len());
     for v in &r.tracks {

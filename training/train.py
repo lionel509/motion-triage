@@ -22,7 +22,7 @@ Usage
         --labels-csv /tmp/synth/labels.csv --epochs 15 --out /tmp/synth/behavior.onnx
 
 Outputs, next to ``--out``:
-  * ``behavior.onnx``               — input ``x`` `[B,T,17,4]`, output ``logits`` `[B,C]`
+  * ``behavior.onnx``               — input ``x`` `[B,T,17,C]` (C=6), output ``logits`` `[B,n_classes]`
   * ``behavior.onnx.classes.json``  — ``{"classes", "seq_len", "min_joint_conf"}``
                                        (the Rust side refuses to guess these)
   * ``behavior.onnx.metrics.json``  — per-class P/R/F1, macro-F1, night slice
@@ -119,6 +119,24 @@ def main() -> int:
                    help="max random in-plane rotation, degrees")
     p.add_argument("--aug-conf-drop", type=float, default=0.1,
                    help="per-joint dropout prob (simulates low visibility)")
+    p.add_argument("--aug-flip-prob", type=float, default=0.5,
+                   help="train-time horizontal flip probability — mirror L/R "
+                        "joints (the most natural, label-preserving skeleton "
+                        "aug; 0 disables). Active only with --augment.")
+    p.add_argument("--patience", type=int, default=0,
+                   help="early-stop after N epochs with no val macro-F1 gain "
+                        "(0 = run all epochs; the best checkpoint is exported "
+                        "either way)")
+    p.add_argument("--class-weight", default="sqrt_inv",
+                   choices=["sqrt_inv", "inv", "effective", "none"],
+                   help="class-imbalance weighting. sqrt_inv (default) tames "
+                        "the blow-up raw inverse-freq ('inv') causes on rare "
+                        "classes; 'effective' = Cui et al. 2019; 'none' = off")
+    p.add_argument("--class-weight-cap", type=float, default=10.0,
+                   help="clamp normalized class weights to [1/cap, cap]")
+    p.add_argument("--label-smoothing", type=float, default=0.05,
+                   help="CE label smoothing — calibrates confidence for the "
+                        "fail-open threshold (0 = off)")
     args = p.parse_args()
 
     try:
@@ -193,20 +211,45 @@ def main() -> int:
             )
             self.head = nn.Linear(128, n_classes)
 
-        def forward(self, x):  # x: [B, T, 17, 4]
+        def forward(self, x):  # x: [B, T, 17, C]
             b, t, v, c = x.shape
-            x = x.reshape(b, t, v * c).permute(0, 2, 1)  # [B, 68, T]
+            x = x.reshape(b, t, v * c).permute(0, 2, 1)  # [B, V*C, T]
             z = self.net(x).squeeze(-1)
             return self.head(z)
 
     model = TemporalConvNet(len(classes)).to(device)
-    # Inverse-frequency class weights — intrusion-grade classes are rare by
-    # nature; unweighted CE would just learn the prior.
-    w = torch.tensor(
-        [len(labeled) / max(1, counts.get(c, 1)) for c in classes],
-        dtype=torch.float32,
+
+    # Class-imbalance weights. Raw inverse-frequency (len/count) is unstable:
+    # an intrusion-grade class with 1 of 6000 samples gets a ~6000x weight and
+    # dominates the gradient. Default to sqrt-inverse-freq, normalized to mean 1
+    # over *supported* classes and clamped to [1/cap, cap]. `inv` restores the
+    # old behavior; `none` disables. Metric (F1) is unweighted regardless.
+    import math
+
+    def _class_weights(mode: str, cap: float) -> list[float]:
+        n = [counts.get(c, 0) for c in classes]
+        if mode == "none":
+            ws = [1.0 for _ in n]
+        elif mode == "inv":
+            tot = sum(n)
+            ws = [tot / max(1, ni) for ni in n]
+        elif mode == "effective":  # Cui et al. 2019, beta=0.999
+            beta = 0.999
+            ws = [(1.0 - beta) / (1.0 - beta ** ni) if ni > 0 else 1.0 for ni in n]
+        else:  # sqrt_inv (default)
+            ws = [1.0 / math.sqrt(ni) if ni > 0 else 1.0 for ni in n]
+        sup = [wi for wi, ni in zip(ws, n) if ni > 0]
+        mean = sum(sup) / len(sup) if sup else 1.0
+        ws = [wi / mean for wi in ws]
+        return [min(cap, max(1.0 / cap, wi)) for wi in ws]
+
+    cw = _class_weights(args.class_weight, args.class_weight_cap)
+    print(f"class weights ({args.class_weight}, cap {args.class_weight_cap}): "
+          + "  ".join(f"{c}={wi:.2f}" for c, wi in zip(classes, cw)))
+    crit = nn.CrossEntropyLoss(
+        weight=torch.tensor(cw, dtype=torch.float32, device=device),
+        label_smoothing=args.label_smoothing,
     )
-    crit = nn.CrossEntropyLoss(weight=(w / w.mean()).to(device))
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ---- Train --------------------------------------------------------------
@@ -217,13 +260,37 @@ def main() -> int:
     # joints' local channels → simulates night/IR low visibility. Velocity is a
     # magnitude (rotation-invariant), left as-is. Fresh per batch each epoch,
     # train split only — val stays clean. Free + scales to all data (no re-encode).
+    # COCO-17 left/right joint swap (nose stays): eyes 1/2, ears 3/4,
+    # shoulders 5/6, elbows 7/8, wrists 9/10, hips 11/12, knees 13/14,
+    # ankles 15/16. Used by the horizontal flip below.
+    FLIP_IDX = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+
     def augment_batch(xb):
         bsz = xb.shape[0]
+        xb = xb.clone()
+
+        # --- Horizontal flip: mirror the skeleton left/right. The most natural,
+        # perfectly label-preserving skeleton aug (a free 2x). Mirror x around
+        # the skeleton's OWN centroid (keeps it in the same screen location, so
+        # zone/position meaning survives), reverse global horizontal travel
+        # (gdx), and swap L/R joint indices so anatomy stays consistent. y and
+        # the velocity magnitude are flip-invariant; gap joints (conf=0) keep 0.
+        if args.aug_flip_prob > 0:
+            fl1 = (torch.rand(bsz, device=xb.device) < args.aug_flip_prob).view(bsz, 1, 1)
+            valid = xb[..., 2] > 0
+            vf = valid.float()
+            cnt = vf.flatten(1).sum(1).clamp(min=1.0)
+            cx = ((xb[..., 0] * vf).flatten(1).sum(1) / cnt).view(bsz, 1, 1)
+            xb[..., 0] = torch.where(fl1 & valid, 2 * cx - xb[..., 0], xb[..., 0])
+            xb[..., 4] = torch.where(fl1, -xb[..., 4], xb[..., 4])
+            xb = torch.where(fl1.unsqueeze(-1), xb[:, :, FLIP_IDX, :], xb)
+
+        # --- Rotation: vary the camera angle. Recomputes geometry on the
+        # (possibly flipped) skeleton above. ---
         rad = args.aug_rot_deg * 3.14159265 / 180.0
         ang = (torch.rand(bsz, device=xb.device) * 2 - 1) * rad
         cos = torch.cos(ang).view(bsz, 1, 1)
         sin = torch.sin(ang).view(bsz, 1, 1)
-        xb = xb.clone()
         x, y, conf = xb[..., 0], xb[..., 1], xb[..., 2]
         valid = conf > 0
         vf = valid.float()
@@ -242,7 +309,28 @@ def main() -> int:
                 xb[..., ch] = torch.where(drop, torch.zeros_like(xb[..., ch]), xb[..., ch])
         return xb
 
+    # Per-class P/R/F1 on val — shared by best-checkpoint selection (below)
+    # and the final metrics report.
+    def prf(mask_pred, mask_true):
+        tp = int((mask_pred & mask_true).sum())
+        fp = int((mask_pred & ~mask_true).sum())
+        fn = int((~mask_pred & mask_true).sum())
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+        return prec, rec, f1
+
+    def val_pred():
+        model.eval()
+        with torch.no_grad():
+            return model(xva.to(device)).argmax(1).cpu()
+
+    def val_macro_f1(pred):
+        return sum(prf(pred == i, yva == i)[2]
+                   for i in range(len(classes))) / len(classes)
+
     n = len(xtr)
+    best_f1, best_epoch, best_state, since = -1.0, -1, None, 0
     for epoch in range(args.epochs):
         model.train()
         perm = torch.randperm(n)
@@ -258,26 +346,34 @@ def main() -> int:
             loss.backward()
             opt.step()
             total += float(loss) * len(idx)
+        # Best-checkpoint selection: keep the weights from the epoch with the
+        # best val macro-F1, not whatever the last epoch lands on (Dropout +
+        # small data make the final epoch a coin-flip). Selecting on val mildly
+        # inflates the reported number — a frozen test split is the honest gate
+        # (next change). Cheap: val set is small, model tiny.
+        pred = val_pred()
+        vf1 = val_macro_f1(pred)
+        if vf1 > best_f1 + 1e-6:
+            best_f1, best_epoch, since = vf1, epoch, 0
+            best_state = {k: v.detach().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            since += 1
         if epoch % 10 == 0 or epoch == args.epochs - 1:
-            model.eval()
-            with torch.no_grad():
-                acc = float((model(xva.to(device)).argmax(1).cpu() == yva)
-                            .float().mean())
-            print(f"  epoch {epoch:>3}  loss {total / n:.4f}  val acc {acc:.3f}")
+            acc = float((pred == yva).float().mean())
+            print(f"  epoch {epoch:>3}  loss {total / n:.4f}  "
+                  f"val acc {acc:.3f}  val macroF1 {vf1:.3f}")
+        if args.patience and since >= args.patience:
+            print(f"  early stop @ epoch {epoch} "
+                  f"(no val macro-F1 gain in {args.patience} epochs)")
+            break
 
-    # ---- Metrics (per-class + macro + night slice) --------------------------
-    model.eval()
-    with torch.no_grad():
-        pred = model(xva.to(device)).argmax(1).cpu()
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"restored best checkpoint: val macro-F1 {best_f1:.3f} @ epoch {best_epoch}")
 
-    def prf(mask_pred, mask_true):
-        tp = int((mask_pred & mask_true).sum())
-        fp = int((mask_pred & ~mask_true).sum())
-        fn = int((~mask_pred & mask_true).sum())
-        prec = tp / (tp + fp) if tp + fp else 0.0
-        rec = tp / (tp + fn) if tp + fn else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
-        return prec, rec, f1
+    # ---- Metrics (per-class + macro + night slice) on the best checkpoint ---
+    pred = val_pred()
 
     per_class = {}
     for c, i in cls_idx.items():
@@ -355,6 +451,9 @@ def main() -> int:
         "seq_len": args.seq_len,
         "min_joint_conf": args.min_joint_conf,
         "label_source": ("csv" if args.labels_csv else "weak_task_category"),
+        "best_epoch": best_epoch,
+        "class_weight": args.class_weight,
+        "label_smoothing": args.label_smoothing,
     }, indent=2))
     print(f"\nwrote {out if onnx_ok else '(no onnx)'} (+ .classes.json, "
           ".weights.npz, .metrics.json)")

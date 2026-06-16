@@ -77,6 +77,8 @@ def run_round(args) -> bool:
         cmd += ["--labels-csv", args.labels_csv]
     if args.weak_from_task_category:
         cmd += ["--weak-from-task-category"]
+    if args.augment:
+        cmd += ["--augment"]
     print(f"[autotrain] training: {' '.join(cmd)}")
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
@@ -113,6 +115,9 @@ def main() -> int:
     p.add_argument("--corpus", action="append", required=True)
     p.add_argument("--labels-csv", default=None)
     p.add_argument("--weak-from-task-category", action="store_true")
+    p.add_argument("--augment", action="store_true",
+                   help="forward --augment to train.py (flip + rotation + "
+                        "conf-dropout skeleton augmentation)")
     p.add_argument("--models-dir", default="models")
     p.add_argument("--min-new-lines", type=int, default=50)
     p.add_argument("--min-val", type=int, default=20,
