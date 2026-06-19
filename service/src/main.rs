@@ -24,6 +24,7 @@ use serde::Serialize;
 
 mod behavior;
 mod draw;
+mod identity;
 mod pose;
 mod sus;
 
@@ -90,7 +91,19 @@ impl Det {
 struct Track { id: usize, cls: usize, last_frame: usize, first_frame: usize, first: Det, last: Det, centers: Vec<(f32, f32)>, heights: Vec<f32>,
     // Frame index of each centers/heights entry — lets the pose pass attach
     // keypoints to the exact frames this track was seen in (gaps excluded).
-    frame_idxs: Vec<usize> }
+    frame_idxs: Vec<usize>,
+    // v3 identity: the matched box and its clothing-color signature per seen
+    // frame (parallel to centers/heights/frame_idxs). `boxes` lets the identity
+    // audit re-crop the original pixels for body/face embedding; `color_sigs`
+    // backs the real-time association veto + the reversal split. Empty when
+    // identity gating is off (additive — nothing downstream reads them then).
+    boxes: Vec<Det>,
+    color_sigs: Vec<identity::ColorSig>,
+    // Set when this track was carved out of a merged one by the reversal split
+    // audit: the original track id + which signal (color/body/face) decided the
+    // two halves were different people. Both None on ordinary tracks.
+    split_from: Option<usize>,
+    split_by: Option<String> }
 
 // ---- Operator-drawn zones / lines (door + restricted-area analytics) --------
 // Coordinates arrive NORMALIZED to fractions of the frame ([0,1]) in the POST
@@ -230,32 +243,89 @@ fn detect(session: &Session, img: &image::RgbImage) -> Result<Vec<Det>> {
     Ok(keep)
 }
 
-fn track(frames: &[Vec<Det>]) -> Vec<Track> {
+/// Recent heading of a track from its last few centers (average step). None
+/// until there are ≥2 points. Appearance-free — pure trajectory.
+fn track_velocity(centers: &[(f32, f32)]) -> Option<(f32, f32)> {
+    let n = centers.len();
+    if n < 2 { return None; }
+    let k = n.min(3);
+    let a = centers[n - k];
+    let b = centers[n - 1];
+    Some(((b.0 - a.0) / (k - 1) as f32, (b.1 - a.1) / (k - 1) as f32))
+}
+
+/// Is a candidate step strongly OPPOSITE the track's recent heading? Both the
+/// heading and the step must be real motion (≥ 0.3 box-heights) so a stationary
+/// jitter never vetoes; then a cosine < -0.3 means ~>110° reversal — physically
+/// implausible for one person at speed, i.e. a different person.
+fn motion_incompatible(vel: Option<(f32, f32)>, step: (f32, f32), bh: f32) -> bool {
+    let Some(v) = vel else { return false };
+    let vm = (v.0 * v.0 + v.1 * v.1).sqrt();
+    let sm = (step.0 * step.0 + step.1 * step.1).sqrt();
+    let floor = 0.30 * bh.max(1.0);
+    if vm < floor || sm < floor { return false; }
+    (v.0 * step.0 + v.1 * step.1) / (vm * sm) < -0.3
+}
+
+/// Per-frame color signatures parallel to `frames` (one entry per detection).
+/// Empty inner vecs (or `gating=false`) disable the appearance veto, restoring
+/// the exact geometry-only behavior.
+fn track(frames: &[Vec<Det>], sigs: &[Vec<identity::ColorSig>],
+         cfg: &identity::IdentityConfig, gating: bool) -> Vec<Track> {
+    let empty: Vec<identity::ColorSig> = Vec::new();
+    let sig_at = |fi: usize, di: usize| -> Option<identity::ColorSig> {
+        sigs.get(fi).unwrap_or(&empty).get(di).copied()
+    };
     let mut tracks: Vec<Track> = Vec::new();
     let mut next_id = 0usize;
     for (fi, dets) in frames.iter().enumerate() {
         let mut used = vec![false; dets.len()];
         for t in tracks.iter_mut() {
             if fi - t.last_frame > MAX_GAP { continue; }
+            // Running clothing signature of this track (mean of seen frames).
+            // Only meaningful when gating + we have sigs; cheap over a few frames.
+            let tmean = if gating && !t.color_sigs.is_empty() {
+                Some(identity::color_mean(&t.color_sigs))
+            } else { None };
+            // Veto: an outfit clearly unlike the track's own is a DIFFERENT
+            // person — refuse the association so they spawn their own track
+            // instead of being stitched into a fake reversal. Lenient on strong
+            // box overlap (geometry is trustworthy there); strict otherwise.
+            let vetoed = |di: usize, overlap: f32| -> bool {
+                let (Some(tm), Some(cs)) = (tmean, sig_at(fi, di)) else { return false };
+                if overlap >= cfg.strong_iou || tm.weak || cs.weak { return false; }
+                identity::color_distance(&tm, &cs) > cfg.veto_color_dist
+            };
             let mut best = (IOU_TRACK, usize::MAX);
             for (di, d) in dets.iter().enumerate() {
                 if used[di] || d.cls != t.cls { continue; } // never merge a person into a car track
                 let s = iou(&t.last, d);
-                if s > best.0 { best = (s, di); }
+                if s > best.0 && !vetoed(di, s) { best = (s, di); }
             }
             // Fallback: no box overlapped (fast mover / post-occlusion shift).
             // Take the nearest unused same-class det within TRACK_DIST_BH of the
             // last box-height — re-links the track instead of spawning a new one
             // (which would read as a reversal/vanish). Distance, not IoU, so it
-            // survives a frame-to-frame jump bigger than a box.
+            // survives a frame-to-frame jump bigger than a box. The veto is
+            // STRICT here (overlap=0): this fallback is exactly the path that
+            // stitches person-A-exits to person-B-enters.
             if best.1 == usize::MAX {
                 let bh = (t.last.y2 - t.last.y1).max(1.0);
                 let (lcx, lcy) = (t.last.cx(), t.last.cy());
+                // Appearance-FREE motion veto (works at night/IR where color is
+                // weak): a track moving one way can't instantly claim a detection
+                // requiring the opposite heading — that's two people, not one
+                // reversing person. Gated to the distance-fallback only, so a real
+                // pacer (who reverses but keeps overlapping boxes → IoU match) is
+                // untouched. This is the night-robust half of the un-merge.
+                let tvel = track_velocity(&t.centers);
                 let mut bd = TRACK_DIST_BH * bh;
                 for (di, d) in dets.iter().enumerate() {
                     if used[di] || d.cls != t.cls { continue; }
-                    let dist = ((d.cx() - lcx).powi(2) + (d.cy() - lcy).powi(2)).sqrt();
-                    if dist < bd { bd = dist; best.1 = di; }
+                    let step = (d.cx() - lcx, d.cy() - lcy);
+                    if gating && motion_incompatible(tvel, step, bh) { continue; }
+                    let dist = (step.0 * step.0 + step.1 * step.1).sqrt();
+                    if dist < bd && !vetoed(di, 0.0) { bd = dist; best.1 = di; }
                 }
             }
             if best.1 != usize::MAX {
@@ -264,13 +334,17 @@ fn track(frames: &[Vec<Det>]) -> Vec<Track> {
                 t.last = d; t.last_frame = fi;
                 t.centers.push((d.cx(), d.cy())); t.heights.push(d.h());
                 t.frame_idxs.push(fi);
+                t.boxes.push(d);
+                t.color_sigs.push(sig_at(fi, best.1).unwrap_or_default());
             }
         }
         for (di, d) in dets.iter().enumerate() {
             if !used[di] {
                 tracks.push(Track { id: next_id, cls: d.cls, last_frame: fi, first_frame: fi,
                     first: *d, last: *d, centers: vec![(d.cx(), d.cy())], heights: vec![d.h()],
-                    frame_idxs: vec![fi] });
+                    frame_idxs: vec![fi], boxes: vec![*d],
+                    color_sigs: vec![sig_at(fi, di).unwrap_or_default()],
+                    split_from: None, split_by: None });
                 next_id += 1;
             }
         }
@@ -288,6 +362,13 @@ impl Decision {
 
 #[derive(Serialize)]
 struct TrackVerdict { id: usize, n: usize, straightness: f32, span: f32, dwell_frac: f32,
+    // Temporal window this track occupies within the clip, as fractions of the
+    // clip duration: start = first_frame/total, end = (last_frame+1)/total, so
+    // (end_frac - start_frac) == dwell_frac. Lets the dashboard trim the VLM's
+    // input to the seconds the subject is actually present instead of the whole
+    // clip. Additive; synthetic event-level rows report 0.0/0.0 (no window).
+    start_frac: f32,
+    end_frac: f32,
     // Absolute dwell estimate in seconds: dwell_frac × the clip window length
     // (clip_seconds in the POSTed context, default 60). The operator reads this
     // directly — <10s = passing through (ignore), ~minute = loitering. Additive;
@@ -318,7 +399,22 @@ struct TrackVerdict { id: usize, n: usize, straightness: f32, span: f32, dwell_f
     // quality-checks the unsure middle) | "dismiss". Additive; only emitted once
     // routing has run. The event-level route is the most severe across tracks.
     #[serde(skip_serializing_if = "Option::is_none")]
-    route: Option<String> }
+    route: Option<String>,
+    // v3 identity (additive): present only on tracks the reversal-split audit
+    // carved out of a merged track — `split_from` is the original track id and
+    // `decided_by` is which signal (color/body/face) judged them distinct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<IdentityInfo> }
+
+#[derive(Serialize, Clone)]
+struct IdentityInfo { split_from: usize, decided_by: String }
+
+// Event-level union of every real track's temporal window, in clip-duration
+// fractions. The dashboard converts these to seconds against the actual clip
+// length and trims the VLM's input (dense frames / clip-as-video) to this span
+// instead of the whole padded clip. Absent when no real track had a window.
+#[derive(Serialize)]
+struct ActiveWindow { start_frac: f32, end_frac: f32 }
 
 /// Is this person box at/adjacent to any vehicle box? True on real overlap, or
 /// when the person's center sits within a vehicle box expanded by ~8% of the
@@ -395,6 +491,12 @@ fn classify(t: &Track, total_frames: usize, w: f32, h: f32, vehicles: &[Det]) ->
     let span = net / frame_diag;
     let frames_seen = (t.last_frame - t.first_frame + 1).max(1);
     let dwell_frac = frames_seen as f32 / total_frames as f32;
+    // Clip-fraction window this track spans (parallels dwell_frac; gives the
+    // dashboard the *position* of the dwell, not just its length).
+    let start_frac = if total_frames > 0 { t.first_frame as f32 / total_frames as f32 } else { 0.0 };
+    let end_frac = if total_frames > 0 {
+        ((t.last_frame + 1) as f32 / total_frames as f32).min(1.0)
+    } else { 0.0 };
     let avg_h = t.heights.iter().sum::<f32>() / n as f32;
     let close = avg_h / h > 0.30; // person taller than ~30% of frame = near camera
     let motion = path / frame_diag; // total center path, frame-normalized
@@ -612,10 +714,10 @@ fn classify(t: &Track, total_frames: usize, w: f32, h: f32, vehicles: &[Det]) ->
     } else {
         (Decision::Dismiss, "walk_by") // moving through / past = normal
     };
-    (decision, TrackVerdict { id: t.id, n, straightness, span, dwell_frac, dwell_s: None,
+    (decision, TrackVerdict { id: t.id, n, straightness, span, dwell_frac, start_frac, end_frac, dwell_s: None,
         decision: decision.as_str().into(), reason: reason.into(),
         keypoints: Vec::new(), behavior: None, behavior_conf: None,
-        sus_score: None, sus_alert: None, route: None })
+        sus_score: None, sus_alert: None, route: None, identity: None })
 }
 
 #[derive(Serialize)]
@@ -623,6 +725,11 @@ struct TriageResult { decision: String, route: String, reason: String, detect_ms
     // Raw NN one-liner for the operator (NO prose): person count, per-person
     // behavior + confidence% + dwell estimate + route. Built by nn_summary().
     summary: String,
+    // Union of all real tracks' temporal windows (clip-fraction). The dashboard
+    // trims the VLM's clip/frames to this span. Absent when no real track had a
+    // window (synthetic-only / no persons) → caller uses the full clip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_window: Option<ActiveWindow>,
     tracks: Vec<TrackVerdict> }
 
 /// Compact raw-NN summary the operator reads directly — no sentence-building.
@@ -693,20 +800,47 @@ fn reason_severity(r: &str) -> u8 {
 /// Event-level behaviors that need the WHOLE track set, not one track: multiple
 /// distinct people present at once, and two people converging. classify() is
 /// strictly per-track, so these are computed here over all person tracks.
+/// (Thin spatial-only wrapper over `event_level_id`; used by tests + callers
+/// that have no identity signatures.)
+#[allow(dead_code)]
 fn event_level(tracks: &[Track], w: f32, h: f32) -> Option<&'static str> {
+    event_level_id(tracks, w, h, None, &identity::IdentityConfig::default())
+}
+
+/// As `event_level`, but when per-track identity signatures are supplied (v3),
+/// a pair that identity confirms is the SAME person (one fragmented by an
+/// occlusion) is NOT counted as two people — it can neither raise `multi_person`
+/// nor `converging`. `id_sigs` is aligned to the `tracks` slice (None per entry
+/// where no signature was built). Falls back to spatial-only when absent.
+fn event_level_id(tracks: &[Track], w: f32, h: f32,
+                  id_sigs: Option<&[Option<identity::IdSig>]>,
+                  id_cfg: &identity::IdentityConfig) -> Option<&'static str> {
     let frame_diag = (w * w + h * h).sqrt();
-    let ppl: Vec<&Track> = tracks.iter()
-        .filter(|t| t.cls == PERSON_CLASS && t.centers.len() >= 3
+    let ppl: Vec<(usize, &Track)> = tracks.iter().enumerate()
+        .filter(|(_, t)| t.cls == PERSON_CLASS && t.centers.len() >= 3
             && (t.heights.iter().sum::<f32>() / t.heights.len() as f32) / h >= 0.12)
         .collect();
     if ppl.len() < 2 { return None; }
     let dist = |p: (f32, f32), q: (f32, f32)| ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt();
+    let same_person = |ia: usize, ib: usize| -> bool {
+        match id_sigs {
+            Some(sigs) => match (sigs.get(ia).and_then(|s| s.as_ref()),
+                                 sigs.get(ib).and_then(|s| s.as_ref())) {
+                (Some(a), Some(b)) =>
+                    identity::identity_match(a, b, id_cfg) == identity::IdMatch::Same,
+                _ => false,
+            },
+            None => false,
+        }
+    };
     let (mut multi, mut converging) = (false, false);
     for i in 0..ppl.len() {
         for j in (i + 1)..ppl.len() {
-            let (a, b) = (ppl[i], ppl[j]);
+            let ((ia, a), (ib, b)) = (ppl[i], ppl[j]);
             // must be alive in the same window (MAX_GAP already bridges dropouts)
             if a.first_frame.max(b.first_frame) > a.last_frame.min(b.last_frame) { continue; }
+            // identity says it's one person split across an occlusion → not two
+            if same_person(ia, ib) { continue; }
             let (af, al) = (*a.centers.first().unwrap(), *a.centers.last().unwrap());
             let (bf, bl) = (*b.centers.first().unwrap(), *b.centers.last().unwrap());
             let (d_start, d_end) = (dist(af, bf), dist(al, bl));
@@ -721,6 +855,147 @@ fn event_level(tracks: &[Track], w: f32, h: f32) -> Option<&'static str> {
         }
     }
     if converging { Some("converging") } else if multi { Some("multi_person") } else { None }
+}
+
+// ---- v3 identity: reversal-split audit ------------------------------------
+// The geometry tracker can stitch person-A-exits to person-B-enters into one
+// track that reverses direction — a false pacing/u_turn/direction_change. When
+// a track carries one of those reasons, split it at its turn point and ask the
+// fused identity check whether the two halves are the SAME person; if they're a
+// confidently DIFFERENT person, hand back two tracks (each re-classifies to a
+// clean walk_by). Same/Unknown leaves the track whole — a real pacer's halves
+// are the same person, so this never fragments one.
+
+fn is_reversal_reason(r: &str) -> bool {
+    matches!(r, "pacing" | "u_turn" | "direction_change")
+}
+
+/// The frame index at which the track's first-half and second-half headings
+/// point most oppositely (cos most negative) — the crossover. Requires a real
+/// reversal (cos < -0.3) and both halves ≥ 3 points.
+fn reversal_split_index(t: &Track) -> Option<usize> {
+    let c = &t.centers;
+    let n = c.len();
+    if n < 6 { return None; }
+    let (mut best_k, mut best_cos) = (None, -0.3f32);
+    for k in 2..=n - 3 {
+        let v1 = (c[k].0 - c[0].0, c[k].1 - c[0].1);
+        let v2 = (c[n - 1].0 - c[k].0, c[n - 1].1 - c[k].1);
+        let m1 = (v1.0 * v1.0 + v1.1 * v1.1).sqrt();
+        let m2 = (v2.0 * v2.0 + v2.1 * v2.1).sqrt();
+        if m1 < 1e-3 || m2 < 1e-3 { continue; }
+        let cos = (v1.0 * v2.0 + v1.1 * v2.1) / (m1 * m2);
+        if cos < best_cos { best_cos = cos; best_k = Some(k); }
+    }
+    best_k
+}
+
+/// Build the fused appearance signature of one track segment `[lo, hi]`: color
+/// from the segment's per-frame sigs (always); body (OSNet) + face (ArcFace from
+/// pose keypoints) from the segment's LARGEST box (best crop) when those models
+/// are loaded and the crop clears the size/confidence gates.
+#[allow(clippy::too_many_arguments)]
+fn seg_idsig(t: &Track, lo: usize, hi: usize, frames: &[image::RgbImage],
+             pose_frames: &[Vec<pose::PoseDet>], reid: Option<&identity::ReidCtx>,
+             face: Option<&identity::FaceCtx>, cfg: &identity::IdentityConfig) -> identity::IdSig {
+    let hi = hi.min(t.centers.len().saturating_sub(1));
+    let mut sig = identity::IdSig::default();
+    if t.color_sigs.len() > hi {
+        sig.color = identity::color_mean(&t.color_sigs[lo..=hi]);
+    }
+    if t.boxes.len() <= hi || t.frame_idxs.len() <= hi { return sig; }
+    // representative frame = the largest box in [lo, hi]
+    let (mut best_k, mut best_h) = (lo, -1.0f32);
+    for k in lo..=hi {
+        if t.heights[k] > best_h { best_h = t.heights[k]; best_k = k; }
+    }
+    let bx = t.boxes[best_k];
+    let fi = t.frame_idxs[best_k];
+    let Some(frame) = frames.get(fi) else { return sig };
+    if let Some(r) = reid {
+        if bx.h() >= cfg.reid_min_box_h {
+            sig.body = r.embed(frame, &bx).ok();
+        }
+    }
+    if let Some(fc) = face {
+        let pd = pose_frames.get(fi).and_then(|dets| {
+            let (cx, cy) = (bx.cx(), bx.cy());
+            dets.iter()
+                .map(|p| (((p.x1 + p.x2) / 2.0 - cx).powi(2) + ((p.y1 + p.y2) / 2.0 - cy).powi(2), p))
+                .filter(|(d2, _)| *d2 < (0.6 * bx.h()).powi(2))
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .map(|(_, p)| p)
+        });
+        if let Some(p) = pd {
+            sig.face = fc.embed_from_kps(frame, &p.kps, cfg.face_kp_conf);
+        }
+    }
+    sig
+}
+
+/// Whole-track appearance signature (for the event-level same-person merge).
+fn track_idsig(t: &Track, frames: &[image::RgbImage], pose_frames: &[Vec<pose::PoseDet>],
+               reid: Option<&identity::ReidCtx>, face: Option<&identity::FaceCtx>,
+               cfg: &identity::IdentityConfig) -> identity::IdSig {
+    seg_idsig(t, 0, t.centers.len().saturating_sub(1), frames, pose_frames, reid, face, cfg)
+}
+
+/// Partition a track at `k` (the pivot belongs to BOTH halves so each is a valid
+/// trajectory) into two new tracks tagged with their origin + deciding signal.
+fn split_track(t: &Track, k: usize, id_a: usize, id_b: usize, by: &str) -> (Track, Track) {
+    let n = t.centers.len();
+    let mk = |lo: usize, hi: usize, id: usize| -> Track {
+        let frame_idxs = t.frame_idxs[lo..=hi].to_vec();
+        let boxes = t.boxes[lo..=hi].to_vec();
+        Track {
+            id, cls: t.cls,
+            first_frame: frame_idxs[0], last_frame: *frame_idxs.last().unwrap(),
+            first: boxes[0], last: *boxes.last().unwrap(),
+            centers: t.centers[lo..=hi].to_vec(),
+            heights: t.heights[lo..=hi].to_vec(),
+            frame_idxs, boxes,
+            color_sigs: t.color_sigs[lo..=hi].to_vec(),
+            split_from: Some(t.id), split_by: Some(by.to_string()),
+        }
+    };
+    (mk(0, k, id_a), mk(k, n - 1, id_b))
+}
+
+/// Expand any reversal-shaped person track the identity check judges to be two
+/// different people into two tracks; pass everything else through unchanged.
+#[allow(clippy::too_many_arguments)]
+fn split_reversal_tracks(tracks: Vec<Track>, frames: &[image::RgbImage],
+                         pose_frames: &[Vec<pose::PoseDet>], reid: Option<&identity::ReidCtx>,
+                         face: Option<&identity::FaceCtx>, cfg: &identity::IdentityConfig,
+                         w: f32, h: f32, total_frames: usize) -> Vec<Track> {
+    let mut next_id = tracks.iter().map(|t| t.id).max().map_or(0, |m| m + 1);
+    let mut out: Vec<Track> = Vec::with_capacity(tracks.len());
+    for t in tracks {
+        let n = t.centers.len();
+        let consistent = t.boxes.len() == n && t.color_sigs.len() == n && t.frame_idxs.len() == n;
+        if t.cls != PERSON_CLASS || n < 6 || !consistent {
+            out.push(t);
+            continue;
+        }
+        let reason = classify(&t, total_frames, w, h, &[]).1.reason;
+        if !is_reversal_reason(&reason) {
+            out.push(t);
+            continue;
+        }
+        let Some(k) = reversal_split_index(&t) else { out.push(t); continue; };
+        let a = seg_idsig(&t, 0, k, frames, pose_frames, reid, face, cfg);
+        let b = seg_idsig(&t, k, n - 1, frames, pose_frames, reid, face, cfg);
+        let (verdict, by) = identity::match_explain(&a, &b, cfg);
+        if verdict != identity::IdMatch::Different {
+            out.push(t);
+            continue;
+        }
+        let (ta, tb) = split_track(&t, k, next_id, next_id + 1, by);
+        next_id += 2;
+        out.push(ta);
+        out.push(tb);
+    }
+    out
 }
 
 /// Door / restricted-area analytics: did any PERSON track enter a drawn zone or
@@ -811,22 +1086,36 @@ fn foot_in_zone(foot: (f32, f32), w: f32, h: f32, meta: &ZonesMeta) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
               pose_session: Option<&Session>, beh: Option<&BehaviorCtx>,
               night: bool, sus_policy: Option<&sus::SusPolicy>,
-              clip_seconds: f32) -> Result<TriageResult> {
+              clip_seconds: f32,
+              reid: Option<&identity::ReidCtx>, face: Option<&identity::FaceCtx>,
+              id_cfg: &identity::IdentityConfig, id_on: bool) -> Result<TriageResult> {
     if frames.is_empty() {
-        return Ok(TriageResult { decision: "dismiss".into(), route: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, summary: "0 ppl".into(), tracks: vec![] });
+        return Ok(TriageResult { decision: "dismiss".into(), route: "dismiss".into(), reason: "no_person".into(), detect_ms: 0, frames: 0, summary: "0 ppl".into(), active_window: None, tracks: vec![] });
     }
     let (w, h) = (frames[0].width() as f32, frames[0].height() as f32);
     let t0 = Instant::now();
     let mut per_frame = Vec::with_capacity(frames.len());
-    for f in frames { per_frame.push(detect(session, f)?); }
+    // v3: per-detection clothing-color signature, computed in the SAME pass we
+    // already decode each frame and detect — no extra image I/O. Off (empty)
+    // when identity gating is disabled, restoring exact geometry-only behavior.
+    let mut per_sig: Vec<Vec<identity::ColorSig>> = Vec::with_capacity(frames.len());
+    for f in frames {
+        let dets = detect(session, f)?;
+        let sigs = if id_on {
+            dets.iter().map(|d| identity::color_sig(f, d)).collect()
+        } else { Vec::new() };
+        per_sig.push(sigs);
+        per_frame.push(dets);
+    }
     let det_ms = t0.elapsed().as_millis() as u64;
-    let tracks = track(&per_frame);
     // Optional pose pass (POSE_MODEL env): full-frame inference once per
     // frame — cost is independent of person count. Keypoints are carried
-    // data only; behavior verdicts below are untouched by them.
+    // data only; behavior verdicts below are untouched by them. Computed BEFORE
+    // the identity split so the face embedder can borrow a track's keypoints.
     let pose_frames: Vec<Vec<pose::PoseDet>> = match pose_session {
         Some(ps) => {
             let mut v = Vec::with_capacity(frames.len());
@@ -835,6 +1124,15 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
         }
         None => Vec::new(),
     };
+    let tracks = track(&per_frame, &per_sig, id_cfg, id_on);
+    // v3 reversal-split audit: a track classified as pacing/u_turn/direction_change
+    // is the prime "two people merged into one reversing path" suspect. Split it
+    // and, if the two halves are a DIFFERENT person by clothing/body/face, emit
+    // them as two tracks (each re-classifies to a plain walk_by). Same/Unknown →
+    // left untouched, so a genuine single-person pacer is never fragmented.
+    let tracks = if id_on {
+        split_reversal_tracks(tracks, frames, &pose_frames, reid, face, id_cfg, w, h, frames.len())
+    } else { tracks };
     // Vehicle tracks are context, not events: one representative box each (they
     // barely move). We classify only the people, passing the cars as context.
     let vehicles: Vec<Det> = tracks.iter().filter(|t| is_vehicle(t.cls)).map(|t| t.last).collect();
@@ -929,26 +1227,46 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
         // Absolute dwell estimate the operator reads directly (frames are sampled
         // across the clip window, so dwell_frac × clip_seconds ≈ seconds present).
         v.dwell_s = Some((v.dwell_frac * clip_seconds * 10.0).round() / 10.0);
+        // v3: report when this track was carved out of a merged one by the audit.
+        if let Some(orig) = t.split_from {
+            v.identity = Some(IdentityInfo {
+                split_from: orig,
+                decided_by: t.split_by.clone().unwrap_or_else(|| "color".into()),
+            });
+        }
         decisions.push(d); verdicts.push(v);
     }
     // Event-level signals (multiple people / converging) over the full track set.
     // Soft signals → the manager (VLM) judges; two people near each other isn't
-    // an emergency on its own.
-    if let Some(reason) = event_level(&tracks, w, h) {
-        decisions.push(Decision::Alert);
+    // an emergency on its own. v3: per-track identity sigs let a single person
+    // fragmented by an occlusion NOT be miscounted as two, and let two unrelated
+    // clean walk-bys settle as a recorded multi_person without an escalation.
+    let id_sigs: Option<Vec<Option<identity::IdSig>>> = if id_on {
+        Some(tracks.iter().map(|t| {
+            if t.cls != PERSON_CLASS || t.centers.is_empty() { return None; }
+            Some(track_idsig(t, frames, &pose_frames, reid, face, id_cfg))
+        }).collect())
+    } else { None };
+    if let Some(reason) = event_level_id(&tracks, w, h, id_sigs.as_deref(), id_cfg) {
+        // multi_person of all-dismiss walk-bys is benign (record, don't escalate);
+        // any non-dismiss member, or a converging pair, still goes to the VLM.
+        let any_live = verdicts.iter().any(|v| v.id != usize::MAX
+            && v.route.as_deref().is_some_and(|r| r != "dismiss"));
+        let mp_route = if reason == "multi_person" && !any_live { "dismiss" } else { "vlm" };
+        if mp_route != "dismiss" { decisions.push(Decision::Alert); }
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
-            dwell_frac: 0.0, dwell_s: None, decision: "alert".into(), reason: reason.into(),
+            dwell_frac: 0.0, start_frac: 0.0, end_frac: 0.0, dwell_s: None, decision: "alert".into(), reason: reason.into(),
             keypoints: Vec::new(), behavior: None, behavior_conf: None,
-            sus_score: None, sus_alert: None, route: Some("vlm".into()) });
+            sus_score: None, sus_alert: None, route: Some(mp_route.into()), identity: None });
     }
     // Zone / door analytics (operator-drawn zones + lines, if any were POSTed).
     // The operator drew that boundary deliberately → crossing it IS the alert.
     if let Some(reason) = zone_line_reason(&tracks, w, h, meta) {
         decisions.push(Decision::Alert);
         verdicts.push(TrackVerdict { id: usize::MAX, n: 0, straightness: 0.0, span: 0.0,
-            dwell_frac: 0.0, dwell_s: None, decision: "alert".into(), reason: reason.into(),
+            dwell_frac: 0.0, start_frac: 0.0, end_frac: 0.0, dwell_s: None, decision: "alert".into(), reason: reason.into(),
             keypoints: Vec::new(), behavior: None, behavior_conf: None,
-            sus_score: None, sus_alert: None, route: Some("alert".into()) });
+            sus_score: None, sus_alert: None, route: Some("alert".into()), identity: None });
     }
     let event = if decisions.iter().any(|d| *d == Decision::Alert) { Decision::Alert } else { Decision::Dismiss };
     // Event route = the most severe track route (alert > vlm > dismiss).
@@ -965,8 +1283,23 @@ fn run_triage(session: &Session, frames: &[image::RgbImage], meta: &ZonesMeta,
         .map(|v| v.reason.clone())
         .unwrap_or_else(|| "none".into());
     let summary = nn_summary(&verdicts);
+    // Event-level active window = union over real tracks (exclude synthetic
+    // id==usize::MAX rows and degenerate 0-span rows). The dashboard trims the
+    // VLM's input to this span; None → no real window → caller uses full clip.
+    let active_window = {
+        let reals: Vec<&TrackVerdict> = verdicts.iter()
+            .filter(|v| v.id != usize::MAX && v.end_frac > v.start_frac)
+            .collect();
+        if reals.is_empty() {
+            None
+        } else {
+            let start = reals.iter().map(|v| v.start_frac).fold(1.0f32, f32::min);
+            let end = reals.iter().map(|v| v.end_frac).fold(0.0f32, f32::max);
+            Some(ActiveWindow { start_frac: start, end_frac: end })
+        }
+    };
     Ok(TriageResult { decision: event.as_str().into(), route: event_route.as_str().into(),
-        reason, detect_ms: det_ms, frames: frames.len(), summary, tracks: verdicts })
+        reason, detect_ms: det_ms, frames: frames.len(), summary, active_window, tracks: verdicts })
 }
 
 fn build_session(model: &str) -> Result<Session> {
@@ -1002,6 +1335,13 @@ struct AppState {
     behavior: Option<Arc<BehaviorCtx>>,
     // Optional suspicion policy (SUS_POLICY env). None = no sus fields emitted.
     sus: Option<Arc<sus::SusPolicy>>,
+    // v3 identity. `id_on` gates the always-free clothing-color tracker veto +
+    // reversal split (default on; IDENTITY_GATING=0 reverts to exact prior
+    // behavior). `reid`/`face` are the optional OSNet/ArcFace embedders.
+    id_on: bool,
+    id_cfg: identity::IdentityConfig,
+    reid: Option<Arc<identity::ReidCtx>>,
+    face: Option<Arc<identity::FaceCtx>>,
 }
 
 async fn health() -> &'static str { "ok" }
@@ -1042,7 +1382,8 @@ async fn triage_endpoint(State(st): State<AppState>, mut mp: Multipart) -> Json<
         let s = st.session.lock().unwrap();
         let pose_guard = st.pose.as_ref().map(|p| p.lock().unwrap());
         run_triage(&s, &frames, &meta, pose_guard.as_deref(), st.behavior.as_deref(),
-                   night, st.sus.as_deref(), clip_seconds)
+                   night, st.sus.as_deref(), clip_seconds,
+                   st.reid.as_deref(), st.face.as_deref(), &st.id_cfg, st.id_on)
     }).await;
     // On ANY failure, fail safe → escalate (let the VLM decide rather than drop).
     match res {
@@ -1092,16 +1433,29 @@ async fn main() -> Result<()> {
             Some(s) => format!("sus on (threshold {})", s.threshold),
             None => "sus off".to_string(),
         };
+        // v3 identity: clothing-color tracker veto + reversal split are ON by
+        // default (the whole point — stop merging two people into fake pacing);
+        // IDENTITY_GATING=0 reverts to exact geometry-only behavior. Body Re-ID
+        // and face are optional embedders, env-gated like pose/behavior.
+        let id_on = std::env::var("IDENTITY_GATING").map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let id_cfg = identity::IdentityConfig::from_env();
+        let reid = if id_on { identity::ReidCtx::from_env()?.map(Arc::new) } else { None };
+        let face = if id_on { identity::FaceCtx::from_env()?.map(Arc::new) } else { None };
+        let id_banner = if id_on {
+            format!("identity on (veto {:.2}, reid {}, face {})", id_cfg.veto_color_dist,
+                if reid.is_some() { "on" } else { "off" }, if face.is_some() { "on" } else { "off" })
+        } else { "identity off".to_string() };
         let app = Router::new()
             .route("/health", get(health))
             .route("/triage", post(triage_endpoint))
             // 16 frames of full-res 4 MP JPEG fit comfortably; axum's 2 MB
             // default rejects multi-frame posts mid-stream (curl error 55).
             .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-            .with_state(AppState { session, pose, behavior, sus });
+            .with_state(AppState { session, pose, behavior, sus, id_on, id_cfg, reid, face });
         let addr = format!("0.0.0.0:{port}");
-        println!("motion-triage serving on {addr} (model {model}, pose {}, {}, {})",
-                 if pose_on { "on" } else { "off" }, beh_banner, sus_banner);
+        println!("motion-triage serving on {addr} (model {model}, pose {}, {}, {}, {})",
+                 if pose_on { "on" } else { "off" }, beh_banner, sus_banner, id_banner);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
         return Ok(());
@@ -1130,19 +1484,28 @@ async fn main() -> Result<()> {
         return behavior::run_behavior_spike(model, corpus, max);
     }
 
-    // CLI mode
+    // CLI mode. IDENTITY_GATING env toggles the v3 layer so the same binary can
+    // run identity OFF (old geometry-only behavior) vs ON (v3) for A/B testing.
+    let id_on = std::env::var("IDENTITY_GATING")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")).unwrap_or(true);
     let model = args.get(1).map(String::as_str).unwrap_or("models/yolo11m.onnx");
     let input = args.get(2).map(String::as_str).unwrap_or("testdata/clip");
     let session = build_session(model)?;
     let frames = load_frames(input)?;
-    let r = run_triage(&session, &frames, &ZonesMeta::default(), None, None, false, None, 60.0)?;
-    println!("{} frames · detect {} ms ({:.1} ms/frame, CoreML) · {} track(s)",
-        r.frames, r.detect_ms, r.detect_ms as f64 / r.frames.max(1) as f64, r.tracks.len());
+    let r = run_triage(&session, &frames, &ZonesMeta::default(), None, None, false, None, 60.0,
+                       None, None, &identity::IdentityConfig::default(), id_on)?;
+    println!("{} frames · detect {} ms ({:.1} ms/frame, CoreML) · {} track(s) · identity {}",
+        r.frames, r.detect_ms, r.detect_ms as f64 / r.frames.max(1) as f64, r.tracks.len(),
+        if id_on { "ON" } else { "OFF" });
     for v in &r.tracks {
-        println!("  track#{:<2} seen {:<2}  straightness {:.2}  span {:.2}  dwell {:.0}%  → {} ({})",
-            v.id, v.n, v.straightness, v.span, v.dwell_frac * 100.0, v.decision, v.reason);
+        let id_note = v.identity.as_ref()
+            .map(|i| format!(" [split from #{} by {}]", i.split_from, i.decided_by))
+            .unwrap_or_default();
+        println!("  track#{:<2} seen {:<2}  straightness {:.2}  span {:.2}  dwell {:.0}%  → {} ({}){}",
+            v.id, v.n, v.straightness, v.span, v.dwell_frac * 100.0, v.decision, v.reason, id_note);
     }
-    println!("\n  ▶ EVENT DECISION: {} ({})", r.decision, r.reason);
+    println!("\n  ▶ EVENT: decision={} route={} reason={}", r.decision, r.route, r.reason);
+    println!("  ▶ SUMMARY: {}", r.summary);
     Ok(())
 }
 
@@ -1176,9 +1539,12 @@ mod tests {
         let first = det(centers[0].0, centers[0].1, ph, PERSON_CLASS);
         let lc = *centers.last().unwrap();
         let last = det(lc.0, lc.1, ph, PERSON_CLASS);
+        let boxes: Vec<Det> = centers.iter().map(|&(cx, cy)| det(cx, cy, ph, PERSON_CLASS)).collect();
         Track { id: 0, cls: PERSON_CLASS, first_frame, last_frame: first_frame + n - 1,
             first, last, heights: vec![ph; n],
-            frame_idxs: (0..n).map(|k| first_frame + k).collect(), centers }
+            frame_idxs: (0..n).map(|k| first_frame + k).collect(),
+            boxes, color_sigs: vec![identity::ColorSig::default(); n],
+            split_from: None, split_by: None, centers }
     }
 
     // A person who walks across and out the right side with NO car present is a
@@ -1248,9 +1614,13 @@ mod tests {
         let first = det(centers[0].0, centers[0].1, heights[0], PERSON_CLASS);
         let lc = *centers.last().unwrap();
         let last = det(lc.0, lc.1, *heights.last().unwrap(), PERSON_CLASS);
+        let boxes: Vec<Det> = centers.iter().zip(heights.iter())
+            .map(|(&(cx, cy), &hh)| det(cx, cy, hh, PERSON_CLASS)).collect();
         Track { id: 0, cls: PERSON_CLASS, first_frame, last_frame: first_frame + n - 1,
             first, last, heights,
-            frame_idxs: (0..n).map(|k| first_frame + k).collect(), centers }
+            frame_idxs: (0..n).map(|k| first_frame + k).collect(),
+            boxes, color_sigs: vec![identity::ColorSig::default(); n],
+            split_from: None, split_by: None, centers }
     }
 
     fn reason_of(t: &Track, total: usize) -> String {
@@ -1474,5 +1844,97 @@ mod tests {
                 in_direction: "a_to_b".into() }],
         };
         assert_eq!(zone_line_reason(&[t], W, H, &meta), Some("door_entry"));
+    }
+
+    // ---- v3 identity: appearance-gated tracking + reversal split ------------
+
+    /// A real clothing-color signature for a solid-color person crop.
+    fn outfit(rgb: [u8; 3]) -> identity::ColorSig {
+        let img = image::RgbImage::from_pixel(120, 300, image::Rgb(rgb));
+        identity::color_sig(&img, &Det { x1: 0.0, y1: 0.0, x2: 120.0, y2: 300.0, score: 0.9, cls: 0 })
+    }
+
+    // THE reported bug. Person A (red shirt) walks left→right and exits; person
+    // B (blue shirt) enters near the same spot going right→left. Geometry alone
+    // stitches them into ONE reversing track (fake pacing). The clothing veto
+    // keeps them apart → two clean tracks.
+    #[test]
+    fn opposite_direction_two_people_are_not_merged() {
+        let red = outfit([200, 30, 30]);
+        let blue = outfit([30, 40, 200]);
+        // one detection per frame: A exits right (f0-3), B enters and goes left (f4-7)
+        let xs_a = [1500.0, 1600.0, 1700.0, 1850.0];
+        let xs_b = [1700.0, 1500.0, 1300.0, 1100.0];
+        let mut per_frame: Vec<Vec<Det>> = Vec::new();
+        let mut per_sig: Vec<Vec<identity::ColorSig>> = Vec::new();
+        for &x in &xs_a {
+            per_frame.push(vec![det(x, 600.0, 200.0, PERSON_CLASS)]);
+            per_sig.push(vec![red]);
+        }
+        for &x in &xs_b {
+            per_frame.push(vec![det(x, 600.0, 200.0, PERSON_CLASS)]);
+            per_sig.push(vec![blue]);
+        }
+        let cfg = identity::IdentityConfig::default();
+        // Geometry only (gating off): the merge happens → ONE reversing track.
+        let merged = track(&per_frame, &per_sig, &cfg, false);
+        assert_eq!(merged.len(), 1, "without the veto the two should merge");
+        // With the clothing veto: two distinct people → TWO tracks.
+        let split = track(&per_frame, &per_sig, &cfg, true);
+        assert_eq!(split.len(), 2, "different outfits must not be stitched together");
+    }
+
+    // The reversal-split audit: a track already merged into a u_turn/pacing whose
+    // two halves are different outfits is carved back into two tracks (each then
+    // re-classifies to a plain walk_by).
+    #[test]
+    fn reversal_split_separates_two_outfits() {
+        let red = outfit([200, 30, 30]);
+        let blue = outfit([30, 40, 200]);
+        // out (right) then back, decelerating to a stop mid-frame so it reads as
+        // a real interior reversal, not a walk-off-the-edge. First half red shirt
+        // (person A), second half blue shirt (person B).
+        let c = vec![(700.0, 600.0), (900.0, 600.0), (1100.0, 600.0), (1200.0, 600.0),
+                     (1100.0, 600.0), (1000.0, 600.0), (980.0, 600.0), (975.0, 600.0)];
+        let mut t = person_track_h(0, c, vec![200.0; 8]);
+        t.color_sigs = vec![red, red, red, red, blue, blue, blue, blue];
+        assert!(is_reversal_reason(&classify(&t, 16, W, H, &[]).1.reason),
+            "merged track should read as a reversal, got {}", classify(&t, 16, W, H, &[]).1.reason);
+        let cfg = identity::IdentityConfig::default();
+        let out = split_reversal_tracks(vec![t], &[], &[], None, None, &cfg, W, H, 16);
+        assert_eq!(out.len(), 2, "two outfits across the reversal must split");
+        assert!(out.iter().all(|s| s.split_from == Some(0)));
+        // each half is now a one-directional walk → dismissed
+        for s in &out {
+            let r = classify(s, 16, W, H, &[]).1;
+            assert_eq!(r.decision, "dismiss", "split half was {} ({})", r.decision, r.reason);
+        }
+    }
+
+    // Guard against OVER-splitting: a genuine single person pacing (same outfit
+    // throughout) must NOT be split — it stays one track / one pacing reason.
+    #[test]
+    fn same_outfit_pacer_is_not_split() {
+        let red = outfit([200, 30, 30]);
+        let c = vec![(500.0, 600.0), (900.0, 600.0), (500.0, 600.0), (900.0, 600.0),
+                     (500.0, 600.0), (900.0, 600.0), (500.0, 600.0)];
+        let mut t = person_track_h(0, c, vec![150.0; 7]);
+        t.color_sigs = vec![red; 7];
+        assert_eq!(classify(&t, 16, W, H, &[]).1.reason, "pacing");
+        let cfg = identity::IdentityConfig::default();
+        let out = split_reversal_tracks(vec![t], &[], &[], None, None, &cfg, W, H, 16);
+        assert_eq!(out.len(), 1, "one person pacing must stay whole");
+        assert_eq!(classify(&out[0], 16, W, H, &[]).1.reason, "pacing");
+    }
+
+    // Color too weak to judge (tiny/no crop) → Unknown → never split (fail safe).
+    #[test]
+    fn weak_color_pacer_is_not_split() {
+        let c = vec![(500.0, 600.0), (900.0, 600.0), (500.0, 600.0), (900.0, 600.0),
+                     (500.0, 600.0), (900.0, 600.0), (500.0, 600.0)];
+        let t = person_track_h(0, c, vec![150.0; 7]); // default (weak) color_sigs
+        let cfg = identity::IdentityConfig::default();
+        let out = split_reversal_tracks(vec![t], &[], &[], None, None, &cfg, W, H, 16);
+        assert_eq!(out.len(), 1, "weak color is Unknown → must not split");
     }
 }

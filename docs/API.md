@@ -45,6 +45,7 @@ know the camera's native resolution.
   "reason": "loitering",
   "detect_ms": 42,
   "frames": 16,
+  "active_window": { "start_frac": 0.10, "end_frac": 0.98 },
   "tracks": [
     {
       "id": 0,
@@ -55,6 +56,8 @@ know the camera's native resolution.
       "straightness": 0.21,
       "span": 0.08,
       "dwell_frac": 0.88,
+      "start_frac": 0.10,
+      "end_frac": 0.98,
       "behavior": "pacing",
       "behavior_conf": 0.91,
       "sus_score": 1.0,
@@ -77,6 +80,20 @@ know the camera's native resolution.
   is loaded.
 - `tracks[].keypoints` — per-frame 17-joint skeletons, COCO order, `[x, y, conf]`
   in source-frame pixels. Omitted/empty until the pose layer ships.
+- `tracks[].identity` — present **only** on a track the v3 reversal-split audit
+  carved out of a merged one: `{ "split_from": <orig track id>, "decided_by":
+  "color" | "body" | "face" }`. Absent on ordinary tracks (see v3 below).
+- `tracks[].start_frac` / `end_frac` — the **temporal window** this track occupies
+  within the clip, as fractions of the clip duration: `start = first_frame/total`,
+  `end = (last_frame+1)/total`, so `end_frac − start_frac == dwell_frac`. Where the
+  dwell *is*, not just how long. Synthetic event-level rows (multi-person, zone/line)
+  report `0.0/0.0`.
+- `active_window` — top-level `{ start_frac, end_frac }` = the **union** of every
+  real track's window (synthetic `id == usize::MAX` and zero-span rows excluded).
+  Absent when no real track had a window. The dashboard converts this to seconds
+  against the actual clip length and **trims the VLM's dense frames / clip to this
+  span** instead of the whole padded clip — same frame budget, every frame lands on
+  the subject. Additive and backward-compatible.
 
 ### Suspicion scoring
 
@@ -150,6 +167,35 @@ The event reason is the highest-severity reason across all tracks.
 | `blip`              | 0   | **dismiss** — too few points to judge a trajectory   |
 
 ---
+
+## v3 — appearance identity (clothing + body + face)
+
+Two **different** people passing a camera in opposite directions used to be
+stitched by the geometry-only tracker into one track that reverses direction —
+a false `pacing` / `u_turn` / `direction_change` / `loitering`. v3 gives the
+tracker an identity sense so they stay distinct, fused with graceful
+degradation (strongest available signal wins):
+
+1. **Clothing color** — pure-Rust HSV histogram of the shirt + pants bands.
+   Always on; vetoes a frame-to-frame association whose outfit is clearly unlike
+   the track's own → the second person spawns their own track.
+2. **Body Re-ID** — OSNet x1.0 512-d (env `REID_MODEL`), run only on the few
+   ambiguous tracks.
+3. **Face** — ArcFace `w600k_r50` 512-d (env `FACE_MODEL`), aligned from the
+   pose facial keypoints. Opportunistic; abstains when the face is too small.
+
+Effects on this contract (all additive):
+
+- A merged reversal track may be returned as **two** tracks, each tagged with
+  `identity` and typically re-classified to a benign `walk_by`.
+- A single person fragmented by an occlusion is no longer miscounted as
+  `multi_person`; and a `multi_person` of only clean walk-bys is recorded with
+  `route: "dismiss"` instead of escalating.
+
+**Config (env):** `IDENTITY_GATING` (default on; `0`/`false` reverts to exact
+geometry-only behavior), `REID_MODEL`, `FACE_MODEL`, and `ID_*` threshold
+overrides (`ID_VETO_COLOR_DIST`, `ID_COLOR_DIFF`, `ID_BODY_DIFF`, `ID_FACE_DIFF`,
+`ID_REID_MIN_BOX_H`, …). Conservative defaults bias toward **not** splitting.
 
 ## Versioning
 
